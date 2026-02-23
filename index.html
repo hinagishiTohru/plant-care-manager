@@ -12,23 +12,16 @@
     body { background: #f0faf2; font-family: 'Hiragino Sans', 'Noto Sans JP', sans-serif; }
     #root { min-height: 100vh; }
     #loading {
-      position: fixed; inset: 0;
-      display: flex; flex-direction: column;
+      position: fixed; inset: 0; display: flex; flex-direction: column;
       align-items: center; justify-content: center;
       background: linear-gradient(135deg, #0a1a0d, #1e3d1e);
       color: #fff; font-size: 16px; gap: 16px; z-index: 9999;
       transition: opacity 0.6s;
     }
-    .spinner {
-      width: 52px; height: 52px;
-      border: 5px solid rgba(255,255,255,0.15);
-      border-top-color: #9dc31a;
-      border-radius: 50%;
-      animation: spin 0.9s linear infinite;
-    }
+    .spinner { width:52px; height:52px; border:5px solid rgba(255,255,255,0.15); border-top-color:#9dc31a; border-radius:50%; animation:spin 0.9s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .loading-text { font-size: 18px; font-weight: 700; letter-spacing: 0.05em; }
-    .loading-sub  { font-size: 12px; color: rgba(255,255,255,0.5); }
+    .loading-text { font-size:18px; font-weight:700; }
+    .loading-sub  { font-size:12px; color:rgba(255,255,255,0.5); }
   </style>
 </head>
 <body>
@@ -38,13 +31,11 @@
     <div class="loading-sub">読み込み中…</div>
   </div>
   <div id="root"></div>
-
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
-
   <script type="text/babel">
-import { useState, useEffect, useRef, useCallback } from "react";
+const { useState, useEffect, useRef, useCallback } = React;
 
 // ── IME-safe input hook ───────────────────────────────────────────────────────
 // Solves the Japanese IME issue where only the first romaji char (e.g. "k") commits.
@@ -189,8 +180,7 @@ function validateCredential(value, label) {
   if (value.length < 8)                         return `${label}：8文字以上で入力してください`;
   if (!/[a-zA-Z]/.test(value))                  return `${label}：英字（a-z, A-Z）を含めてください`;
   if (!/[0-9]/.test(value))                     return `${label}：数字（0-9）を含めてください`;
-  if (!/[!@#$%^&*()\-_=+\[\]{};:'",.<>/?`~\\|]/.test(value))
-                                                 return `${label}：特殊記号（例：!@#$%）を含めてください`;
+  if (!/[!@#$%^&*()\-_=+\[\]{};:'",.\/<>?`~\\|]/.test(value)) return `${label}：特殊記号（例：!@#$%）を含めてください`;
   return null;
 }
 
@@ -769,14 +759,7 @@ async function groqChat(messages, model="llama-3.3-70b-versatile", maxTokens=120
 async function analyzePhotoDiff(prev, curr, plantName) {
   try {
     const text = await groqChat([
-      { role:"system", content:"あなたは植物の生育管理アシスタントです。2枚の植物写真を比較して日本語で変化点を指摘してください。
-形式：
-【変化あり🌱】または【変化なし✓】
-・葉の色：
-・草丈・大きさ：
-・健康状態：
-・気になる点：
-・アドバイス：" },
+      { role:"system", content:"あなたは植物の生育管理アシスタントです。2枚の植物写真を比較して日本語で変化点を指摘してください。\n形式：\n【変化あり🌱】または【変化なし✓】\n・葉の色：\n・草丈・大きさ：\n・健康状態：\n・気になる点：\n・アドバイス：" },
       { role:"user", content:[
         {type:"text",text:`${plantName}の前回と今回の写真を比較してください。`},
         {type:"image_url",image_url:{url:prev}},
@@ -898,17 +881,7 @@ async function getAiAdvice(plantName, entriesSummary) {
     const monthName = `${today.getMonth()+1}月`;
     const text = await groqChat([
       { role:"system", content:`あなたは${plantName}の栽培専門家です。ユーザーの過去の管理記録を分析し、具体的な改善アドバイスを日本語で提供してください。現在は${monthName}です。` },
-      { role:"user",   content:`以下は${plantName}の最近の管理記録です：
-
-${entriesSummary}
-
-この記録を分析し、以下の形式でアドバイスしてください：
-
-【総合評価】
-【水やりについて】
-【肥料について】
-【気温・環境について】
-【今後のアドバイス（${monthName}のポイント）】` }
+      { role:"user",   content:`以下は${plantName}の最近の管理記録です：\n\n${entriesSummary}\n\nこの記録を分析し、以下の形式でアドバイスしてください：\n\n【総合評価】\n【水やりについて】\n【肥料について】\n【気温・環境について】\n【今後のアドバイス（${monthName}のポイント）】` }
     ], "llama-3.3-70b-versatile", 1200);
     return text || "アドバイスを取得できませんでした";
   } catch(e) { return `AI分析エラー: ${e.message}`; }
