@@ -142,10 +142,24 @@ const randomHex  = n => bytesToHex(crypto.getRandomValues(new Uint8Array(n)));
 // SHARED STORAGE HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
 async function sGet(key, shared=true) {
-  try { const r = await window.storage.get(key,shared); return r ? JSON.parse(r.value) : null; } catch { return null; }
+  try {
+    if (window.storage) {
+      const r = await window.storage.get(key, shared);
+      return r ? JSON.parse(r.value) : null;
+    } else {
+      const v = localStorage.getItem("pcm_ls__" + key);
+      return v ? JSON.parse(v) : null;
+    }
+  } catch { return null; }
 }
 async function sSet(key, val, shared=true) {
-  try { await window.storage.set(key, JSON.stringify(val), shared); } catch {}
+  try {
+    if (window.storage) {
+      await window.storage.set(key, JSON.stringify(val), shared);
+    } else {
+      localStorage.setItem("pcm_ls__" + key, JSON.stringify(val));
+    }
+  } catch {}
 }
 
 // Account registry (shared, NOT encrypted — just hashes)
