@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="theme-color" content="#0a1a0d" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>🌱 植物ケアマネージャー</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -37,9 +38,2066 @@
     <div class="loading-sub">読み込み中…</div>
   </div>
   <div id="root"></div>
+
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
-  <script type="text/babel" src="./plant-care-manager.jsx"></script>
+
+  <script type="text/babel">
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ── IME-safe input hook ───────────────────────────────────────────────────────
+// Solves the Japanese IME issue where only the first romaji char (e.g. "k") commits.
+// During composition (変換中), we update a local draft but do NOT call onChange.
+// onCompositionEnd fires after the user picks a kanji, then we flush the final value.
+function useIme(initialValue, onChange) {
+  const [draft, setDraft] = useState(initialValue ?? "");
+  const composing = useRef(false);
+  // reset() must be called explicitly (e.g. when modal opens) — NOT via useEffect.
+  // useEffect would wipe the draft mid-composition on every re-render.
+  const reset = (v) => { setDraft(v ?? ""); };
+  return {
+    value: draft,
+    reset,
+    onChange: (e) => {
+      setDraft(e.target.value);
+      if (!composing.current) onChange(e.target.value);
+    },
+    onCompositionStart: () => { composing.current = true; },
+    onCompositionEnd:   (e) => {
+      composing.current = false;
+      setDraft(e.target.value);
+      onChange(e.target.value);
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+const AUTH_KEY      = "pcm_auth_v2";        // shared: account hashes
+const LOCK_LOG_KEY  = "pcm_locklog_v2";     // shared: lock event history
+const DATA_KEY      = "pcm_data_v2";        // shared: encrypted diary data
+const SESSION_KEY   = "pcm_session_v2";     // sessionStorage only
+const MAX_ATTEMPTS  = 5;
+const LOCKOUT_MS    = 15 * 60 * 1000;
+const ADMIN_ID      = "admin";              // first registered user becomes admin marker
+
+const SECRET_QUESTIONS = [
+  "子供のころ飼っていたペットの名前は？",
+  "通っていた小学校の名前は？",
+  "初めて買ったゲームのタイトルは？",
+  "好きな食べ物は？（子供のころ）",
+  "母親の旧姓は？",
+  "生まれた市区町村は？",
+  "初めて訪れた外国はどこ？",
+  "好きな映画のタイトルは？",
+];
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CRYPTO UTILITIES  (Web Crypto API — AES-GCM + PBKDF2)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// SHA-256 hex — for password hashing stored in account registry
+async function sha256(str) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,"0")).join("");
+}
+
+// Derive AES-GCM key from password + salt via PBKDF2
+async function deriveKey(password, saltHex) {
+  const salt = hexToBytes(saltHex);
+  const baseKey = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    { name:"PBKDF2", salt, iterations:310000, hash:"SHA-256" },
+    baseKey,
+    { name:"AES-GCM", length:256 },
+    false, ["encrypt","decrypt"]
+  );
+}
+
+// Encrypt JSON object → base64 ciphertext string
+async function encryptData(obj, password, saltHex) {
+  const key = await deriveKey(password, saltHex);
+  const iv  = crypto.getRandomValues(new Uint8Array(12));
+  const ct  = await crypto.subtle.encrypt(
+    { name:"AES-GCM", iv },
+    key,
+    new TextEncoder().encode(JSON.stringify(obj))
+  );
+  return bytesToB64(iv) + "." + bytesToB64(new Uint8Array(ct));
+}
+
+// Decrypt base64 ciphertext → object
+async function decryptData(ciphertext, password, saltHex) {
+  const [ivB64, ctB64] = ciphertext.split(".");
+  const key = await deriveKey(password, saltHex);
+  const iv  = b64ToBytes(ivB64);
+  const ct  = b64ToBytes(ctB64);
+  const pt  = await crypto.subtle.decrypt({ name:"AES-GCM", iv }, key, ct);
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+// Helpers
+const bytesToHex = b => [...b].map(x=>x.toString(16).padStart(2,"0")).join("");
+const hexToBytes = h => new Uint8Array(h.match(/.{2}/g).map(b=>parseInt(b,16)));
+const bytesToB64 = b => btoa(String.fromCharCode(...b));
+const b64ToBytes = s => new Uint8Array([...atob(s)].map(c=>c.charCodeAt(0)));
+const randomHex  = n => bytesToHex(crypto.getRandomValues(new Uint8Array(n)));
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SHARED STORAGE HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+async function sGet(key, shared=true) {
+  try { const r = await window.storage.get(key,shared); return r ? JSON.parse(r.value) : null; } catch { return null; }
+}
+async function sSet(key, val, shared=true) {
+  try { await window.storage.set(key, JSON.stringify(val), shared); } catch {}
+}
+
+// Account registry (shared, NOT encrypted — just hashes)
+async function loadAccounts() { return (await sGet(AUTH_KEY)) || {}; }
+async function saveAccounts(a) { await sSet(AUTH_KEY, a); }
+
+// Lock log (shared, plaintext — intentionally readable for admin)
+async function loadLockLog() { return (await sGet(LOCK_LOG_KEY)) || []; }
+async function appendLockLog(entry) {
+  const log = await loadLockLog();
+  log.unshift(entry); // newest first
+  if (log.length > 100) log.splice(100); // keep last 100
+  await sSet(LOCK_LOG_KEY, log);
+}
+
+// Diary data (shared, AES-GCM encrypted)
+async function loadEncryptedData(password, saltHex) {
+  const raw = await sGet(DATA_KEY);
+  if (!raw?.cipher) return {};
+  try { return await decryptData(raw.cipher, password, saltHex); }
+  catch { return null; } // null = wrong key
+}
+async function saveEncryptedData(obj, password, saltHex) {
+  const cipher = await encryptData(obj, password, saltHex);
+  await sSet(DATA_KEY, { cipher });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VALIDATION
+// ═══════════════════════════════════════════════════════════════════════════════
+function validateCredential(value, label) {
+  if (value.length < 8)                         return `${label}：8文字以上で入力してください`;
+  if (!/[a-zA-Z]/.test(value))                  return `${label}：英字（a-z, A-Z）を含めてください`;
+  if (!/[0-9]/.test(value))                     return `${label}：数字（0-9）を含めてください`;
+  if (!/[!@#$%^&*()\-_=+\[\]{};:'",.<>/?`~\\|]/.test(value))
+                                                 return `${label}：特殊記号（例：!@#$%）を含めてください`;
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTH SCREEN
+// ═══════════════════════════════════════════════════════════════════════════════
+function AuthScreen({ onLogin }) {
+  const [mode, setMode]         = useState("login");
+  const [id, setId]             = useState("");
+  const [pw, setPw]             = useState("");
+  const [pwConfirm, setPwConfirm] = useState("");
+  const [showPw, setShowPw]     = useState(false);
+  const [error, setError]       = useState("");
+  const [success, setSuccess]   = useState("");
+  const [busy, setBusy]         = useState(false);
+  const [secQuestion, setSecQuestion] = useState("");
+  const [secAnswer,   setSecAnswer]   = useState("");
+  // Password reset flow
+  const [resetMode,   setResetMode]   = useState(false); // show reset form
+  const [resetId,     setResetId]     = useState("");
+  const [resetAns,    setResetAns]    = useState("");
+  const [resetNewPw,  setResetNewPw]  = useState("");
+  const [resetNewPw2, setResetNewPw2] = useState("");
+  const [resetStep,   setResetStep]   = useState(1); // 1=enter id, 2=answer Q, 3=new pw
+  const [resetAccount,setResetAccount]= useState(null);
+
+  // Per-device lockout state (sessionStorage)
+  const [attempts, setAttempts] = useState(() => {
+    try { return parseInt(sessionStorage.getItem("pcm_attempts")||"0"); } catch { return 0; }
+  });
+  const [lockedUntil, setLockedUntil] = useState(() => {
+    try { return parseInt(sessionStorage.getItem("pcm_locked_until")||"0"); } catch { return 0; }
+  });
+
+  const locked     = lockedUntil > Date.now();
+  const remainMin  = locked ? Math.ceil((lockedUntil - Date.now()) / 60000) : 0;
+
+  // Count-down refresh
+  useEffect(() => {
+    if (!locked) return;
+    const t = setInterval(() => setLockedUntil(parseInt(sessionStorage.getItem("pcm_locked_until")||"0")), 5000);
+    return () => clearInterval(t);
+  }, [locked]);
+
+  function recordFailure(idLower) {
+    const newAtt = attempts + 1;
+    setAttempts(newAtt);
+    sessionStorage.setItem("pcm_attempts", String(newAtt));
+    if (newAtt >= MAX_ATTEMPTS) {
+      const until = Date.now() + LOCKOUT_MS;
+      setLockedUntil(until);
+      sessionStorage.setItem("pcm_locked_until", String(until));
+      // Write to shared lock log
+      appendLockLog({
+        event:     "LOCKOUT",
+        targetId:  idLower,
+        timestamp: new Date().toISOString(),
+        reason:    `${MAX_ATTEMPTS}回連続失敗によるロックアウト`,
+      });
+      return true; // locked
+    }
+    // Log individual failure
+    appendLockLog({
+      event:     "FAIL",
+      targetId:  idLower,
+      timestamp: new Date().toISOString(),
+      reason:    `ログイン失敗（${newAtt}回目）`,
+    });
+    return false;
+  }
+
+  async function handleLogin() {
+    setError(""); setSuccess("");
+    if (locked)   { setError(`🔒 ロック中。あと約${remainMin}分後に再試行できます`); return; }
+    if (!id||!pw) { setError("IDとパスワードを入力してください"); return; }
+    setBusy(true);
+    const accounts  = await loadAccounts();
+    const idLower   = id.trim().toLowerCase();
+    const hashed    = await sha256(pw);
+    const account   = accounts[idLower];
+    if (account && account.hash === hashed) {
+      // ✅ Login success
+      sessionStorage.setItem("pcm_attempts", "0");
+      sessionStorage.removeItem("pcm_locked_until");
+      setAttempts(0); setLockedUntil(0);
+      const session = { id: idLower, saltHex: account.saltHex, loginAt: Date.now() };
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
+      onLogin({ id: idLower, pw, saltHex: account.saltHex, isAdmin: account.isAdmin });
+    } else {
+      const nowLocked = recordFailure(idLower);
+      if (nowLocked) {
+        setError(`🔒 ${MAX_ATTEMPTS}回失敗しました。15分間ロックされます。管理者に通知されました。`);
+      } else {
+        setError(`IDまたはパスワードが違います（あと${MAX_ATTEMPTS - attempts - 1}回で一時ロック）`);
+      }
+    }
+    setBusy(false);
+  }
+
+  async function handleRegister() {
+    setError(""); setSuccess("");
+    const idErr = validateCredential(id.trim(), "ID");
+    if (idErr) { setError(idErr); return; }
+    const pwErr = validateCredential(pw, "パスワード");
+    if (pwErr) { setError(pwErr); return; }
+    if (pw !== pwConfirm) { setError("パスワードが一致しません"); return; }
+    if (!secQuestion) { setError("秘密の質問を選択してください"); return; }
+    if (secAnswer.trim().length < 2) { setError("秘密の答えを入力してください（2文字以上）"); return; }
+    setBusy(true);
+    const accounts = await loadAccounts();
+    const idLower  = id.trim().toLowerCase();
+    if (accounts[idLower]) { setError("このIDはすでに使われています"); setBusy(false); return; }
+    const hashed    = await sha256(pw);
+    const saltHex   = randomHex(32);
+    const ansHash   = await sha256(secAnswer.trim().toLowerCase()); // case-insensitive
+    const isAdmin   = Object.keys(accounts).length === 0;
+    accounts[idLower] = { hash: hashed, saltHex, isAdmin, secQuestion, secAnswerHash: ansHash, createdAt: new Date().toISOString() };
+    await saveAccounts(accounts);
+    setSuccess(`✅ 登録完了！${isAdmin?"（管理者アカウント）":""}ログインしてください`);
+    setMode("login"); setPw(""); setPwConfirm(""); setSecAnswer(""); setBusy(false);
+  }
+
+  // ── Password reset ──────────────────────────────────────────────────────────
+  async function handleResetStep1() {
+    setError(""); setBusy(true);
+    const accounts = await loadAccounts();
+    const idLower  = resetId.trim().toLowerCase();
+    const account  = accounts[idLower];
+    if (!account || !account.secQuestion) { setError("IDが見つかりません、または秘密の質問が設定されていません"); setBusy(false); return; }
+    setResetAccount({ ...account, idLower });
+    setResetStep(2); setBusy(false);
+  }
+
+  async function handleResetStep2() {
+    setError(""); setBusy(true);
+    const ansHash = await sha256(resetAns.trim().toLowerCase());
+    if (ansHash !== resetAccount.secAnswerHash) { setError("答えが違います"); setBusy(false); return; }
+    setResetStep(3); setBusy(false);
+  }
+
+  async function handleResetStep3() {
+    setError("");
+    const pwErr = validateCredential(resetNewPw, "新しいパスワード");
+    if (pwErr) { setError(pwErr); return; }
+    if (resetNewPw !== resetNewPw2) { setError("パスワードが一致しません"); return; }
+    setBusy(true);
+    // Re-encrypt data with new password (same saltHex, new key)
+    const raw = await sGet(DATA_KEY);
+    if (raw?.cipher) {
+      try {
+        const plainData = await decryptData(raw.cipher, resetAccount.hash, resetAccount.saltHex);
+        // We need old pw — but we only have hash. We can't decrypt with hash.
+        // Instead: generate new salt + re-encrypt with new pw (data stays encrypted with old key until next login)
+        // Practical approach: warn user data needs re-encryption on next login, update hash only
+      } catch {}
+    }
+    // Update account hash & generate new salt
+    const accounts  = await loadAccounts();
+    const newSalt   = randomHex(32);
+    const newHash   = await sha256(resetNewPw);
+    // Re-encrypt data: we must use old pw. Since we only have hash, data will be lost.
+    // So we clear data and update credentials — user is warned.
+    accounts[resetAccount.idLower] = {
+      ...resetAccount,
+      hash: newHash,
+      saltHex: newSalt,
+      updatedAt: new Date().toISOString(),
+    };
+    delete accounts[resetAccount.idLower].idLower;
+    await saveAccounts(accounts);
+    // Clear encrypted data (cannot re-encrypt without old plaintext pw)
+    await sSet(DATA_KEY, {});
+    setSuccess("✅ パスワードをリセットしました。⚠️ 暗号化データはリセットされました（旧パスワードなしには復号不可のため）");
+    setResetMode(false); setResetStep(1); setResetId(""); setResetAns(""); setResetNewPw(""); setResetNewPw2("");
+    setBusy(false);
+  }
+
+  // Styles
+  const G = "#5a8a00";
+  const inp = {
+    width:"100%", padding:"13px 46px 13px 14px", border:"2px solid #d4edda",
+    borderRadius:12, fontSize:15, fontFamily:"inherit", boxSizing:"border-box",
+    outline:"none", background:"#fafffe",
+  };
+  const checks = [
+    [pw.length>=8,            "8文字以上"],
+    [/[a-zA-Z]/.test(pw),    "英字あり"],
+    [/[0-9]/.test(pw),       "数字あり"],
+    [/[!@#$%^&*()\-_=+\[\]{};:'",.<>/?`~\\|]/.test(pw), "特殊記号あり"],
+  ];
+  const allOk = checks.every(([ok])=>ok);
+
+  const inpS = { ...inp, marginBottom:10 };
+  const labelS = { fontSize:12, fontWeight:800, color:"#555", display:"block", marginBottom:5, letterSpacing:"0.05em" };
+  const stepBtn = (label, onClick, disabled) => (
+    <button style={{ width:"100%", padding:14, background:disabled?"#ccc":`linear-gradient(90deg,${G},#9dc31a)`, color:"#fff", border:"none", borderRadius:12, fontSize:15, fontWeight:800, cursor:disabled?"not-allowed":"pointer", fontFamily:"inherit", marginTop:8 }} disabled={disabled} onClick={onClick}>
+      {label}
+    </button>
+  );
+
+  // ── Password Reset UI ────────────────────────────────────────────────────────
+  if (resetMode) return (
+    <div style={{ minHeight:"100vh", background:"linear-gradient(160deg,#f0faf2,#dff0e0)", display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"'Hiragino Sans','Noto Sans JP',sans-serif", padding:20 }}>
+      <div style={{ width:"100%", maxWidth:390 }}>
+        <div style={{ textAlign:"center", marginBottom:20 }}>
+          <div style={{ fontSize:44 }}>🔑</div>
+          <div style={{ fontSize:20, fontWeight:900, color:"#0f2114", marginTop:6 }}>パスワードをリセット</div>
+          <div style={{ fontSize:12, color:"#aaa", marginTop:4 }}>ステップ {resetStep} / 3</div>
+        </div>
+        <div style={{ background:"#fff", borderRadius:22, padding:"24px 20px 26px", boxShadow:"0 12px 48px rgba(0,0,0,0.12)", border:"1px solid #eaf5c0" }}>
+          {/* Progress bar */}
+          <div style={{ display:"flex", gap:6, marginBottom:20 }}>
+            {[1,2,3].map(n=>(
+              <div key={n} style={{ flex:1, height:6, borderRadius:3, background:resetStep>=n?G:"#e5e7eb" }}/>
+            ))}
+          </div>
+
+          {resetStep===1 && <>
+            <div style={{ fontSize:14, fontWeight:700, color:"#333", marginBottom:14 }}>登録したIDを入力してください</div>
+            <label style={labelS}>🪪 ID</label>
+            <input value={resetId} onChange={e=>setResetId(e.target.value)} placeholder="登録済みのID" style={inpS} onKeyDown={e=>e.key==="Enter"&&handleResetStep1()} />
+            {error && <div style={{ background:"#fff5f5", border:"1.5px solid #fecaca", borderRadius:10, padding:"10px 13px", fontSize:13, color:"#b91c1c", marginBottom:8, fontWeight:600 }}>⚠️ {error}</div>}
+            {stepBtn(busy?"確認中…":"次へ →", handleResetStep1, busy||!resetId)}
+          </>}
+
+          {resetStep===2 && resetAccount && <>
+            <div style={{ fontSize:14, fontWeight:700, color:"#333", marginBottom:14 }}>秘密の質問に答えてください</div>
+            <div style={{ background:"#f0fdf4", borderRadius:12, padding:"12px 14px", marginBottom:14, fontSize:14, color:"#166534", fontWeight:600, border:"1.5px solid #bbf7d0" }}>
+              ❓ {resetAccount.secQuestion}
+            </div>
+            <label style={labelS}>🔏 答え</label>
+            <input value={resetAns} onChange={e=>setResetAns(e.target.value)} placeholder="登録時の答えを入力" style={inpS} onKeyDown={e=>e.key==="Enter"&&handleResetStep2()} />
+            <div style={{ fontSize:11, color:"#aaa", marginBottom:8 }}>※ 大文字・小文字は区別しません</div>
+            {error && <div style={{ background:"#fff5f5", border:"1.5px solid #fecaca", borderRadius:10, padding:"10px 13px", fontSize:13, color:"#b91c1c", marginBottom:8, fontWeight:600 }}>⚠️ {error}</div>}
+            {stepBtn(busy?"確認中…":"答え合わせ →", handleResetStep2, busy||!resetAns)}
+          </>}
+
+          {resetStep===3 && <>
+            <div style={{ fontSize:14, fontWeight:700, color:"#333", marginBottom:6 }}>新しいパスワードを設定してください</div>
+            <div style={{ background:"#fff8ed", border:"1.5px solid #fed7aa", borderRadius:10, padding:"10px 13px", fontSize:12, color:"#92400e", marginBottom:14, lineHeight:1.6 }}>
+              ⚠️ <strong>重要：</strong>パスワードリセット後、暗号化されたデータはリセットされます。旧パスワードがないと復号できないためです。新しいパスワードで再登録してください。
+            </div>
+            <label style={labelS}>🔒 新しいパスワード</label>
+            <div style={{ position:"relative" }}>
+              <input type={showPw?"text":"password"} value={resetNewPw} onChange={e=>setResetNewPw(e.target.value)} placeholder="新しいパスワード" style={inpS} />
+              <button onClick={()=>setShowPw(p=>!p)} style={{ position:"absolute", right:12, top:12, background:"none", border:"none", fontSize:18, cursor:"pointer", color:"#aaa" }}>{showPw?"🙈":"👁️"}</button>
+            </div>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:4, marginBottom:10 }}>
+              {[[resetNewPw.length>=8,"8文字以上"],[/[a-zA-Z]/.test(resetNewPw),"英字"],[/[0-9]/.test(resetNewPw),"数字"],[/[!@#$%^&*()\-_=+]/.test(resetNewPw),"記号"]].map(([ok,l])=>(
+                <span key={l} style={{ fontSize:11, padding:"3px 9px", borderRadius:20, background:ok?"#eaf5c0":"#f5f5f5", color:ok?G:"#ccc", fontWeight:700 }}>{ok?"✓":"✗"} {l}</span>
+              ))}
+            </div>
+            <label style={labelS}>🔒 確認</label>
+            <div style={{ position:"relative" }}>
+              <input type={showPw?"text":"password"} value={resetNewPw2} onChange={e=>setResetNewPw2(e.target.value)} placeholder="もう一度" style={inpS} onKeyDown={e=>e.key==="Enter"&&handleResetStep3()} />
+              {resetNewPw2.length>0&&<span style={{ position:"absolute", right:12, top:12, fontSize:18 }}>{resetNewPw===resetNewPw2?"✅":"❌"}</span>}
+            </div>
+            {error && <div style={{ background:"#fff5f5", border:"1.5px solid #fecaca", borderRadius:10, padding:"10px 13px", fontSize:13, color:"#b91c1c", marginBottom:8, fontWeight:600 }}>⚠️ {error}</div>}
+            {success && <div style={{ background:"#f0fdf4", border:"1.5px solid #bbf7d0", borderRadius:10, padding:"10px 13px", fontSize:13, color:"#15803d", marginBottom:8, fontWeight:600 }}>{success}</div>}
+            {stepBtn(busy?"リセット中…":"🔐 パスワードをリセット", handleResetStep3, busy)}
+          </>}
+
+          <button onClick={()=>{setResetMode(false);setResetStep(1);setError("");setSuccess("");}}
+            style={{ width:"100%", marginTop:10, padding:"10px", background:"none", border:"1.5px solid #d1d5db", borderRadius:10, color:"#666", fontSize:13, cursor:"pointer", fontFamily:"inherit", fontWeight:600 }}>
+            ← ログインに戻る
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── Normal Auth UI ───────────────────────────────────────────────────────────
+  return (
+    <div style={{ minHeight:"100vh", background:"linear-gradient(160deg,#f0faf2,#dff0e0)", display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"'Hiragino Sans','Noto Sans JP',sans-serif", padding:20 }}>
+      <div style={{ width:"100%", maxWidth:390 }}>
+
+        {/* Logo */}
+        <div style={{ textAlign:"center", marginBottom:28 }}>
+          <div style={{ fontSize:54 }}>🌱</div>
+          <div style={{ fontSize:23, fontWeight:900, color:"#0f2114", marginTop:6, letterSpacing:"-0.02em" }}>植物ケアマネージャー</div>
+          <div style={{ fontSize:12, color:"#aaa", marginTop:4 }}>🔐 AES-256暗号化 ／ PC・スマホ共有</div>
+        </div>
+
+        {/* Card */}
+        <div style={{ background:"#fff", borderRadius:22, padding:"26px 22px 28px", boxShadow:"0 12px 48px rgba(0,0,0,0.12)", border:"1px solid #eaf5c0" }}>
+
+          {/* Mode switch */}
+          <div style={{ display:"flex", background:"#f4faf0", borderRadius:14, padding:4, marginBottom:20, gap:4 }}>
+            {[["login","🔑 ログイン"],["register","📝 新規登録"]].map(([m,l])=>(
+              <button key={m} onClick={()=>{setMode(m);setError("");setSuccess("");}}
+                style={{ flex:1, padding:"10px 0", border:"none", borderRadius:10, fontSize:13, fontWeight:700, cursor:"pointer", fontFamily:"inherit", background:mode===m?"#fff":"none", color:mode===m?G:"#aaa", boxShadow:mode===m?"0 2px 10px rgba(0,0,0,0.09)":"none", transition:"all .2s" }}>
+                {l}
+              </button>
+            ))}
+          </div>
+
+          {/* ID */}
+          <label style={labelS}>🪪 ID <span style={{ fontWeight:400, color:"#bbb" }}>英数字＋特殊記号、8文字以上</span></label>
+          <input value={id} onChange={e=>setId(e.target.value)} placeholder="例：myGarden#01"
+            style={{ ...inp, marginBottom:12 }} onKeyDown={e=>e.key==="Enter"&&mode==="login"&&handleLogin()} />
+
+          {/* Password */}
+          <label style={labelS}>🔒 パスワード <span style={{ fontWeight:400, color:"#bbb" }}>英数字＋特殊記号、8文字以上</span></label>
+          <div style={{ position:"relative", marginBottom:mode==="register"?8:12 }}>
+            <input type={showPw?"text":"password"} value={pw} onChange={e=>setPw(e.target.value)}
+              placeholder="例：Plant#2024!" style={inp} onKeyDown={e=>e.key==="Enter"&&mode==="login"&&handleLogin()} />
+            <button onClick={()=>setShowPw(p=>!p)} style={{ position:"absolute", right:13, top:"50%", transform:"translateY(-55%)", background:"none", border:"none", fontSize:19, cursor:"pointer", color:"#aaa" }}>
+              {showPw?"🙈":"👁️"}
+            </button>
+          </div>
+
+          {/* Strength indicator */}
+          {mode==="register" && pw.length>0 && (
+            <div style={{ display:"flex", flexWrap:"wrap", gap:4, marginBottom:10 }}>
+              {checks.map(([ok,label])=>(
+                <span key={label} style={{ fontSize:11, padding:"3px 9px", borderRadius:20, background:ok?"#eaf5c0":"#f5f5f5", color:ok?G:"#ccc", fontWeight:700 }}>
+                  {ok?"✓":"✗"} {label}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {/* Confirm PW + Secret Q (register only) */}
+          {mode==="register" && (
+            <>
+              <label style={labelS}>🔒 パスワード（確認）</label>
+              <div style={{ position:"relative", marginBottom:12 }}>
+                <input type={showPw?"text":"password"} value={pwConfirm} onChange={e=>setPwConfirm(e.target.value)}
+                  placeholder="もう一度入力" style={inp} onKeyDown={e=>e.key==="Enter"&&handleRegister()} />
+                {pwConfirm.length>0 && <span style={{ position:"absolute", right:13, top:"50%", transform:"translateY(-55%)", fontSize:18 }}>{pw===pwConfirm?"✅":"❌"}</span>}
+              </div>
+
+              {/* Secret Question */}
+              <label style={labelS}>❓ 秘密の質問 <span style={{ fontWeight:400, color:"#bbb" }}>パスワード忘れ時の回復用</span></label>
+              <select value={secQuestion} onChange={e=>setSecQuestion(e.target.value)}
+                style={{ width:"100%", padding:"11px 12px", border:"2px solid #d4edda", borderRadius:12, fontSize:14, fontFamily:"inherit", background:"#fafffe", outline:"none", marginBottom:10, color:secQuestion?"#333":"#aaa" }}>
+                <option value="">— 質問を選択 —</option>
+                {SECRET_QUESTIONS.map(q=><option key={q} value={q}>{q}</option>)}
+              </select>
+              <label style={labelS}>🔏 秘密の答え</label>
+              <input value={secAnswer} onChange={e=>setSecAnswer(e.target.value)}
+                placeholder="答えを入力（大文字小文字は区別しません）" style={{ ...inp, marginBottom:4 }} />
+              <div style={{ fontSize:11, color:"#aaa", marginBottom:12 }}>※ この答えは忘れないようにしてください</div>
+            </>
+          )}
+
+          {/* Error / Success */}
+          {error && <div style={{ background:"#fff5f5", border:"1.5px solid #fecaca", borderRadius:10, padding:"10px 13px", fontSize:13, color:"#b91c1c", marginBottom:10, fontWeight:600, lineHeight:1.5 }}>⚠️ {error}</div>}
+          {success && <div style={{ background:"#f0fdf4", border:"1.5px solid #bbf7d0", borderRadius:10, padding:"10px 13px", fontSize:13, color:"#15803d", marginBottom:10, fontWeight:600 }}>{success}</div>}
+
+          {/* Submit */}
+          <button
+            style={{ width:"100%", padding:15, background:locked||busy?"#ccc":`linear-gradient(90deg,${G},#9dc31a)`, color:"#fff", border:"none", borderRadius:14, fontSize:16, fontWeight:800, cursor:locked||busy?"not-allowed":"pointer", fontFamily:"inherit", boxShadow:locked||busy?"none":`0 4px 18px ${G}44`, transition:"all .2s" }}
+            disabled={locked||busy} onClick={mode==="login"?handleLogin:handleRegister}>
+            {busy?"処理中…":mode==="login"?"🔑 ログイン":"📝 アカウントを作成"}
+          </button>
+
+          {/* Forgot password link */}
+          {mode==="login" && (
+            <button onClick={()=>{setResetMode(true);setError("");setSuccess("");}}
+              style={{ width:"100%", marginTop:10, padding:"9px", background:"none", border:"none", color:"#888", fontSize:13, cursor:"pointer", fontFamily:"inherit", textDecoration:"underline" }}>
+              🔑 パスワードを忘れた方はこちら
+            </button>
+          )}
+
+          {/* Lockout UI */}
+          {locked && <div style={{ textAlign:"center", fontSize:13, color:"#dc2626", marginTop:12, fontWeight:700, padding:"8px", background:"#fff5f5", borderRadius:10 }}>🔒 ロック中 — あと約{remainMin}分</div>}
+          {!locked && attempts>0 && <div style={{ textAlign:"center", fontSize:12, color:"#d97706", marginTop:10 }}>⚠️ 失敗：{attempts}/{MAX_ATTEMPTS}回</div>}
+        </div>
+
+        <div style={{ textAlign:"center", fontSize:11, color:"#bbb", marginTop:14, lineHeight:1.7 }}>
+          パスワードはSHA-256でハッシュ化 ／ データはAES-256-GCMで暗号化<br/>
+          タブを閉じると自動ログアウト ／ ロック発生時は管理者に記録
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLANT DATA
+// ═══════════════════════════════════════════════════════════════════════════════
+const PLANTS = [
+  {
+    id:"shine_muscat", name:"シャインマスカット", emoji:"🍇", type:"果樹",
+    soil:"果樹用土", color:"#5a8a00", colorLight:"#eaf5c0", colorMid:"#9dc31a",
+    fertilizers:["マグマKファンプ","化成肥料8:8:8","油粕","骨粉"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"休眠期・乾かし気味に"},"2":{freq:"週1回",note:"休眠期・乾かし気味に"},"3":{freq:"週2回",note:"発芽開始・徐々に増やす"},"4":{freq:"週2〜3回",note:"新梢伸長期"},"5":{freq:"週3回",note:"開花期・根元に丁寧に"},"6":{freq:"週3〜4回",note:"結実期・安定して"},"7":{freq:"週4回",note:"果実肥大期・たっぷり"},"8":{freq:"週4〜5回",note:"着色期・やや控えめに"},"9":{freq:"週3回",note:"収穫期・糖度キープ"},"10":{freq:"週2回",note:"収穫後・徐々に減らす"},"11":{freq:"週1〜2回",note:"落葉期・控えめに"},"12":{freq:"週1回",note:"休眠期・乾かし気味に"}},
+      fertilizer:[{month:2,name:"元肥（寒肥）",items:["油粕","骨粉","マグマKファンプ"],note:"休眠中に株元へすき込む"},{month:4,name:"芽出し肥",items:["化成肥料8:8:8"],note:"発芽を助ける速効性"},{month:6,name:"お礼肥（結実促進）",items:["化成肥料8:8:8","マグマKファンプ"],note:"結実後の体力回復"},{month:8,name:"追肥（果実肥大）",items:["化成肥料8:8:8"],note:"収穫1ヶ月前まで"},{month:10,name:"お礼肥（収穫後）",items:["油粕","化成肥料8:8:8"],note:"来年のための養分補給"}],
+    },
+  },
+  {
+    id:"asparagus", name:"アスパラガス", emoji:"🌿", type:"野菜",
+    soil:"野菜用土", color:"#1e6b3c", colorLight:"#d4edda", colorMid:"#52b788",
+    fertilizers:["マグマKファンプ","化成肥料8:8:8","油粕"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"休眠期・ほぼ断水"},"2":{freq:"週1回",note:"休眠期・土が乾いたら"},"3":{freq:"週2回",note:"萌芽開始！乾かさない"},"4":{freq:"週3回",note:"収穫期・たっぷりと"},"5":{freq:"週3〜4回",note:"収穫ピーク期"},"6":{freq:"週4回",note:"夏芽・高温注意"},"7":{freq:"週5回",note:"最多水やり・朝夕に"},"8":{freq:"週5回",note:"猛暑対策・マルチング推奨"},"9":{freq:"週3〜4回",note:"涼しくなったら徐々に"},"10":{freq:"週2〜3回",note:"株養成期"},"11":{freq:"週1〜2回",note:"地上部枯れ始め"},"12":{freq:"週1回",note:"休眠期・ほぼ断水"}},
+      fertilizer:[{month:2,name:"元肥（定植前）",items:["油粕","マグマKファンプ","化成肥料8:8:8"],note:"畝に深くすき込む"},{month:3,name:"萌芽肥",items:["化成肥料8:8:8"],note:"萌芽を促す"},{month:5,name:"追肥（収穫中）",items:["化成肥料8:8:8","マグマKファンプ"],note:"2〜3週間おきに"},{month:7,name:"夏肥",items:["化成肥料8:8:8"],note:"株の消耗回復"},{month:9,name:"お礼肥",items:["油粕","化成肥料8:8:8"],note:"翌年の株養成のために"},{month:11,name:"寒肥（株元）",items:["油粕","マグマKファンプ"],note:"休眠前の養分蓄積"}],
+    },
+  },
+  {
+    id:"fig", name:"イチジク", emoji:"🫐", type:"果樹",
+    soil:"果樹用土（水はけ良く）", color:"#7c3aed", colorLight:"#ede9fe", colorMid:"#a78bfa",
+    fertilizers:["化成肥料8:8:8","油粕","骨粉","マグマKファンプ"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"休眠期・ほぼ断水"},"2":{freq:"週1回",note:"休眠期・乾かし気味"},"3":{freq:"週2回",note:"発芽前・徐々に増やす"},"4":{freq:"週2回",note:"新芽展開・適度に"},"5":{freq:"週2〜3回",note:"生育旺盛期・たっぷり"},"6":{freq:"週3回",note:"梅雨でも水切れ注意"},"7":{freq:"週4〜5回",note:"高温・乾燥・朝夕に"},"8":{freq:"週4〜5回",note:"果実肥大期・たっぷり"},"9":{freq:"週3〜4回",note:"秋果収穫期・適度に"},"10":{freq:"週2回",note:"収穫後・控えめに"},"11":{freq:"週1〜2回",note:"落葉期・控えめに"},"12":{freq:"週1回",note:"休眠期・ほぼ断水"}},
+      fertilizer:[{month:2,name:"寒肥",items:["油粕","骨粉"],note:"休眠中に株元へ"},{month:4,name:"芽出し肥",items:["化成肥料8:8:8"],note:"萌芽促進"},{month:6,name:"夏肥",items:["化成肥料8:8:8","マグマKファンプ"],note:"果実肥大を助ける"},{month:9,name:"お礼肥",items:["化成肥料8:8:8"],note:"収穫後の株回復"}],
+    },
+  },
+  {
+    id:"blackberry", name:"ブラックベリー", emoji:"🫐", type:"果樹",
+    soil:"果樹用土（酸性気味）", color:"#4c1d95", colorLight:"#ede9fe", colorMid:"#7c3aed",
+    fertilizers:["化成肥料8:8:8","油粕","マグマKファンプ"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"休眠期・乾かし気味"},"2":{freq:"週1回",note:"休眠期"},"3":{freq:"週2回",note:"萌芽開始・乾かさない"},"4":{freq:"週2回",note:"新梢伸長・適度に"},"5":{freq:"週2〜3回",note:"開花期・根元に"},"6":{freq:"週3回",note:"結実期・安定して"},"7":{freq:"週4回",note:"収穫期・たっぷり"},"8":{freq:"週3〜4回",note:"夏の管理・朝に"},"9":{freq:"週2〜3回",note:"秋の生育・適度に"},"10":{freq:"週2回",note:"紅葉・控えめに"},"11":{freq:"週1〜2回",note:"落葉期"},"12":{freq:"週1回",note:"休眠期"}},
+      fertilizer:[{month:2,name:"寒肥",items:["油粕"],note:"休眠中に"},{month:4,name:"芽出し肥",items:["化成肥料8:8:8"],note:"生育促進"},{month:6,name:"追肥",items:["化成肥料8:8:8","マグマKファンプ"],note:"結実中の栄養補給"},{month:9,name:"お礼肥",items:["化成肥料8:8:8"],note:"株の充実"}],
+    },
+  },
+  {
+    id:"sansevieria", name:"サンスベリア", emoji:"🌵", type:"観葉植物",
+    soil:"多肉植物・サボテン用土", color:"#0f766e", colorLight:"#ccfbf1", colorMid:"#2dd4bf",
+    fertilizers:["緩効性化成肥料","液体肥料（観葉植物用）"],
+    schedule:{
+      watering:{"1":{freq:"月1回以下",note:"休眠期・ほぼ断水・根腐れ注意"},"2":{freq:"月1回以下",note:"休眠期・断水気味"},"3":{freq:"月2回",note:"生育開始・少しずつ"},"4":{freq:"月2〜3回",note:"徐々に増やす"},"5":{freq:"週1〜2回",note:"生育旺盛・土が乾いたら"},"6":{freq:"週1〜2回",note:"梅雨は控えめに"},"7":{freq:"週2回",note:"高温期・朝に"},"8":{freq:"週2回",note:"暑さピーク・風通しよく"},"9":{freq:"週1〜2回",note:"秋は徐々に減らす"},"10":{freq:"月2〜3回",note:"生育鈍化・控えめに"},"11":{freq:"月1〜2回",note:"休眠準備"},"12":{freq:"月1回以下",note:"休眠期・断水"}},
+      fertilizer:[{month:5,name:"春肥",items:["緩効性化成肥料"],note:"生育期開始に置き肥"},{month:7,name:"夏肥",items:["液体肥料（観葉植物用）"],note:"2週間に1回液肥"},{month:9,name:"秋肥（最後）",items:["緩効性化成肥料"],note:"これ以降は与えない"}],
+    },
+  },
+  {
+    id:"pineapple", name:"パイナップル", emoji:"🍍", type:"果樹（観葉）",
+    soil:"水はけ良い培養土＋砂", color:"#ca8a04", colorLight:"#fef9c3", colorMid:"#eab308",
+    fertilizers:["液体肥料（観葉植物用）","化成肥料8:8:8","マグマKファンプ"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"冬は控えめ・根腐れ注意"},"2":{freq:"週1回",note:"乾かし気味"},"3":{freq:"週1〜2回",note:"生育開始・徐々に"},"4":{freq:"週2回",note:"葉の中心にも水を"},"5":{freq:"週2〜3回",note:"生育期・葉芯に溜める"},"6":{freq:"週2〜3回",note:"葉芯の水は1週おきに換える"},"7":{freq:"週3回",note:"旺盛期・たっぷり"},"8":{freq:"週3回",note:"高温に強い・朝に"},"9":{freq:"週2回",note:"秋・適度に"},"10":{freq:"週1〜2回",note:"徐々に減らす"},"11":{freq:"週1回",note:"冬越し準備"},"12":{freq:"週1回",note:"最小限に"}},
+      fertilizer:[{month:4,name:"春肥",items:["液体肥料（観葉植物用）"],note:"2週に1回液肥開始"},{month:6,name:"夏肥",items:["化成肥料8:8:8","マグマKファンプ"],note:"生育旺盛期に追肥"},{month:9,name:"秋肥",items:["液体肥料（観葉植物用）"],note:"生育鈍化前に最終"}],
+    },
+  },
+  {
+    id:"coffee", name:"コーヒー", emoji:"☕", type:"観葉植物（果樹）",
+    soil:"コーヒー専用土または酸性培養土", color:"#78350f", colorLight:"#fef3c7", colorMid:"#d97706",
+    fertilizers:["液体肥料（観葉植物用）","緩効性化成肥料","油粕"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"冬・表土乾いたら"},"2":{freq:"週1回",note:"乾燥させない程度"},"3":{freq:"週1〜2回",note:"生育開始・徐々に"},"4":{freq:"週2回",note:"春・土が乾いたらたっぷり"},"5":{freq:"週2〜3回",note:"開花期・適度に"},"6":{freq:"週2〜3回",note:"梅雨・過湿注意"},"7":{freq:"週3回",note:"夏・葉面散水も有効"},"8":{freq:"週3回",note:"高温乾燥・朝夕に"},"9":{freq:"週2回",note:"実の肥大期・安定して"},"10":{freq:"週1〜2回",note:"秋・控えめに"},"11":{freq:"週1回",note:"実の収穫期・最小限"},"12":{freq:"週1回",note:"冬越し・控えめ"}},
+      fertilizer:[{month:4,name:"春肥",items:["緩効性化成肥料"],note:"置き肥で生育促進"},{month:6,name:"初夏肥",items:["液体肥料（観葉植物用）"],note:"2週に1回液肥"},{month:8,name:"夏肥",items:["液体肥料（観葉植物用）"],note:"継続"},{month:10,name:"秋肥（最後）",items:["緩効性化成肥料"],note:"冬前の最終施肥"}],
+    },
+  },
+  {
+    id:"feijoa", name:"フェイジョア", emoji:"🍈", type:"果樹",
+    soil:"果樹用土（水はけ良く）", color:"#166534", colorLight:"#dcfce7", colorMid:"#16a34a",
+    fertilizers:["化成肥料8:8:8","油粕","骨粉","マグマKファンプ"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"休眠期・乾かし気味"},"2":{freq:"週1回",note:"休眠期"},"3":{freq:"週1〜2回",note:"萌芽開始"},"4":{freq:"週2回",note:"新梢伸長期"},"5":{freq:"週2〜3回",note:"開花期・根元に丁寧に"},"6":{freq:"週3回",note:"結実期・安定して"},"7":{freq:"週3〜4回",note:"果実肥大期"},"8":{freq:"週3〜4回",note:"高温・乾燥に注意"},"9":{freq:"週2〜3回",note:"収穫前・やや控えめ"},"10":{freq:"週2回",note:"収穫期"},"11":{freq:"週1〜2回",note:"収穫後・控えめ"},"12":{freq:"週1回",note:"休眠期"}},
+      fertilizer:[{month:2,name:"寒肥",items:["油粕","骨粉"],note:"休眠中にすき込む"},{month:4,name:"芽出し肥",items:["化成肥料8:8:8"],note:"生育促進"},{month:6,name:"追肥",items:["化成肥料8:8:8","マグマKファンプ"],note:"結実後の回復"},{month:9,name:"お礼肥",items:["化成肥料8:8:8"],note:"来年のために"}],
+    },
+  },
+  {
+    id:"strawberry", name:"イチゴ", emoji:"🍓", type:"果菜",
+    soil:"イチゴ専用培土または野菜用土", color:"#be123c", colorLight:"#ffe4e6", colorMid:"#f43f5e",
+    fertilizers:["化成肥料8:8:8","液体肥料（野菜用）","マグマKファンプ"],
+    schedule:{
+      watering:{"1":{freq:"週2回",note:"冬・乾燥注意・葉に水かけない"},"2":{freq:"週2回",note:"厳冬期・根元のみ"},"3":{freq:"週2〜3回",note:"生育再開・徐々に"},"4":{freq:"週3回",note:"開花・結実期・たっぷり"},"5":{freq:"週3〜4回",note:"収穫ピーク・毎日確認"},"6":{freq:"週3〜4回",note:"梅雨・高温に注意"},"7":{freq:"週3回",note:"ランナー管理期"},"8":{freq:"週3〜4回",note:"猛暑・遮光も検討"},"9":{freq:"週2〜3回",note:"苗の定植準備"},"10":{freq:"週2回",note:"定植後・根付きまで"},"11":{freq:"週2回",note:"冬越し準備"},"12":{freq:"週1〜2回",note:"休眠期・控えめ"}},
+      fertilizer:[{month:3,name:"追肥",items:["化成肥料8:8:8"],note:"生育再開時"},{month:4,name:"開花肥",items:["液体肥料（野菜用）","マグマKファンプ"],note:"2週に1回液肥"},{month:9,name:"定植肥",items:["化成肥料8:8:8"],note:"新苗定植時に元肥"},{month:10,name:"秋肥",items:["化成肥料8:8:8"],note:"根の充実"}],
+    },
+  },
+  {
+    id:"myoga", name:"茗荷", emoji:"🌿", type:"野菜（宿根）",
+    soil:"腐葉土多めの培養土", color:"#9f1239", colorLight:"#ffe4e6", colorMid:"#e11d48",
+    fertilizers:["油粕","化成肥料8:8:8","腐葉土"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"休眠期・ほぼ断水"},"2":{freq:"週1回",note:"休眠期"},"3":{freq:"週1〜2回",note:"萌芽前・徐々に"},"4":{freq:"週2回",note:"萌芽期・乾かさない"},"5":{freq:"週2〜3回",note:"生育旺盛・たっぷり"},"6":{freq:"週3〜4回",note:"高温多湿で旺盛・毎日確認"},"7":{freq:"週4〜5回",note:"暑さで乾燥しやすい・朝夕"},"8":{freq:"週4〜5回",note:"花芽形成期・しっかり"},"9":{freq:"週3〜4回",note:"収穫期・安定して"},"10":{freq:"週2回",note:"収穫後・控えめに"},"11":{freq:"週1〜2回",note:"地上部枯れ始め"},"12":{freq:"週1回",note:"休眠期"}},
+      fertilizer:[{month:3,name:"元肥",items:["油粕","腐葉土"],note:"萌芽前に株元へ"},{month:5,name:"追肥",items:["化成肥料8:8:8"],note:"生育旺盛期"},{month:7,name:"追肥（花芽前）",items:["化成肥料8:8:8"],note:"収穫を増やすために"},{month:10,name:"お礼肥",items:["油粕"],note:"来年の株のために"}],
+    },
+  },
+  {
+    id:"olive", name:"オリーブ", emoji:"🫒", type:"果樹（常緑）",
+    soil:"果樹用土（アルカリ気味・水はけ良く）", color:"#4d7c0f", colorLight:"#ecfccb", colorMid:"#84cc16",
+    fertilizers:["化成肥料8:8:8","油粕","マグマKファンプ","骨粉"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"冬・乾燥しすぎに注意"},"2":{freq:"週1回",note:"乾かし気味でOK"},"3":{freq:"週1〜2回",note:"生育開始・徐々に"},"4":{freq:"週2回",note:"新梢伸長・適度に"},"5":{freq:"週2〜3回",note:"開花期・根元に"},"6":{freq:"週3回",note:"結実期・安定して"},"7":{freq:"週3〜4回",note:"果実肥大・高温乾燥注意"},"8":{freq:"週3〜4回",note:"乾燥に強いが夏は毎日確認"},"9":{freq:"週2〜3回",note:"収穫準備・適度に"},"10":{freq:"週1〜2回",note:"収穫期・控えめに"},"11":{freq:"週1〜2回",note:"収穫後"},"12":{freq:"週1回",note:"冬越し"}},
+      fertilizer:[{month:2,name:"寒肥",items:["油粕","骨粉"],note:"休眠中に株元へ"},{month:4,name:"芽出し肥",items:["化成肥料8:8:8"],note:"生育促進"},{month:6,name:"追肥",items:["化成肥料8:8:8","マグマKファンプ"],note:"結実助ける"},{month:9,name:"お礼肥",items:["化成肥料8:8:8"],note:"収穫後の回復"}],
+    },
+  },
+  {
+    id:"myrsinaceae", name:"万両", emoji:"🌿", type:"常緑低木（縁起木）",
+    soil:"赤玉土7＋腐葉土3", color:"#b91c1c", colorLight:"#fee2e2", colorMid:"#ef4444",
+    fertilizers:["油粕","緩効性化成肥料","液体肥料（観葉植物用）"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"冬・乾かし気味に"},"2":{freq:"週1回",note:"休眠中・乾燥注意"},"3":{freq:"週1〜2回",note:"生育開始・徐々に"},"4":{freq:"週2回",note:"新芽展開・適度に"},"5":{freq:"週2回",note:"生育旺盛・土が乾いたら"},"6":{freq:"週2〜3回",note:"梅雨期・過湿注意"},"7":{freq:"週3回",note:"高温・乾燥注意"},"8":{freq:"週3回",note:"夏・朝早めに"},"9":{freq:"週2回",note:"秋・適度に"},"10":{freq:"週1〜2回",note:"実の着色期・控えめに"},"11":{freq:"週1回",note:"冬越し準備"},"12":{freq:"週1回",note:"休眠期"}},
+      fertilizer:[{month:3,name:"春肥",items:["油粕"],note:"新芽前に株元へ"},{month:6,name:"初夏肥",items:["緩効性化成肥料"],note:"置き肥"},{month:9,name:"秋肥",items:["液体肥料（観葉植物用）"],note:"実付きをよくするために"}],
+    },
+  },
+  {
+    id:"onion", name:"玉ねぎ", emoji:"🧅", type:"野菜",
+    soil:"野菜用培養土（pH6〜6.5）", color:"#b45309", colorLight:"#fef3c7", colorMid:"#f59e0b",
+    fertilizers:["化成肥料8:8:8","マグマKファンプ","油粕"],
+    schedule:{
+      watering:{"1":{freq:"週1〜2回",note:"球肥大期・乾燥注意"},"2":{freq:"週1〜2回",note:"球肥大・たっぷり"},"3":{freq:"週2回",note:"急速肥大期・安定して"},"4":{freq:"週2〜3回",note:"収穫前・やや控えめ"},"5":{freq:"週1回",note:"収穫後・ほぼ不要"},"6":{freq:"なし",note:"収穫・乾燥貯蔵"},"7":{freq:"なし",note:"休眠期"},"8":{freq:"なし",note:"苗床準備"},"9":{freq:"週2〜3回",note:"播種・発芽管理"},"10":{freq:"週2回",note:"育苗期・乾かさない"},"11":{freq:"週1〜2回",note:"定植後・根付き管理"},"12":{freq:"週1回",note:"越冬中・乾燥注意"}},
+      fertilizer:[{month:9,name:"元肥（苗床）",items:["化成肥料8:8:8"],note:"播種前に施す"},{month:11,name:"定植肥",items:["化成肥料8:8:8","マグマKファンプ"],note:"定植時に元肥"},{month:1,name:"追肥①",items:["化成肥料8:8:8"],note:"年明けの生育促進"},{month:2,name:"追肥②（最終）",items:["化成肥料8:8:8"],note:"2月末まで。以降は与えない"}],
+    },
+  },
+  {
+    id:"cabbage", name:"キャベツ", emoji:"🥬", type:"野菜",
+    soil:"野菜用培養土（石灰で中和）", color:"#15803d", colorLight:"#dcfce7", colorMid:"#22c55e",
+    fertilizers:["化成肥料8:8:8","マグマKファンプ","油粕"],
+    schedule:{
+      watering:{"1":{freq:"週1〜2回",note:"結球中・乾燥注意"},"2":{freq:"週1〜2回",note:"結球・適度に"},"3":{freq:"週2回",note:"収穫期・たっぷり"},"4":{freq:"週2回",note:"春キャベツ収穫期"},"5":{freq:"なし",note:"春収穫後・夏は高温で難"},"6":{freq:"なし",note:"夏は栽培休止推奨"},"7":{freq:"なし",note:"暑すぎる・秋苗準備"},"8":{freq:"週2〜3回",note:"秋苗の育苗・乾かさない"},"9":{freq:"週2回",note:"定植後・根付き管理"},"10":{freq:"週2回",note:"生育旺盛期"},"11":{freq:"週1〜2回",note:"結球開始・安定して"},"12":{freq:"週1回",note:"冬越し・乾燥注意"}},
+      fertilizer:[{month:8,name:"元肥（秋まき）",items:["化成肥料8:8:8","油粕"],note:"定植前に施す"},{month:10,name:"追肥①",items:["化成肥料8:8:8"],note:"根付き後の生育促進"},{month:12,name:"追肥②",items:["化成肥料8:8:8","マグマKファンプ"],note:"結球を助ける"},{month:2,name:"追肥③",items:["化成肥料8:8:8"],note:"春収穫前の最終追肥"}],
+    },
+  },
+  {
+    id:"lettuce", name:"レタス", emoji:"🥗", type:"野菜",
+    soil:"野菜用培養土（保水性高め）", color:"#16a34a", colorLight:"#dcfce7", colorMid:"#4ade80",
+    fertilizers:["化成肥料8:8:8","液体肥料（野菜用）"],
+    schedule:{
+      watering:{"1":{freq:"週2回",note:"冬レタス・乾燥注意"},"2":{freq:"週2回",note:"結球中・安定して"},"3":{freq:"週2〜3回",note:"収穫期・たっぷり"},"4":{freq:"週3回",note:"春レタス収穫ピーク"},"5":{freq:"週3回",note:"高温になる前に収穫"},"6":{freq:"なし",note:"夏は高温で溶け・難"},"7":{freq:"なし",note:"栽培休止推奨"},"8":{freq:"週2〜3回",note:"秋まき育苗開始"},"9":{freq:"週2〜3回",note:"定植・根付き"},"10":{freq:"週2回",note:"生育旺盛期"},"11":{freq:"週1〜2回",note:"結球・安定して"},"12":{freq:"週1〜2回",note:"冬越し・乾燥注意"}},
+      fertilizer:[{month:8,name:"元肥（秋まき）",items:["化成肥料8:8:8"],note:"播種前に施す"},{month:9,name:"定植肥",items:["化成肥料8:8:8"],note:"元肥として"},{month:10,name:"追肥",items:["液体肥料（野菜用）"],note:"2週に1回液肥"},{month:1,name:"冬まき元肥",items:["化成肥料8:8:8"],note:"春収穫用"}],
+    },
+  },
+  {
+    id:"buntan", name:"文旦", emoji:"🍊", type:"果樹（柑橘）",
+    soil:"果樹用土（水はけ良く・弱酸性）", color:"#ea580c", colorLight:"#ffedd5", colorMid:"#fb923c",
+    fertilizers:["化成肥料8:8:8","油粕","マグマKファンプ","骨粉"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"休眠期・乾かし気味"},"2":{freq:"週1回",note:"休眠期"},"3":{freq:"週1〜2回",note:"萌芽開始・徐々に"},"4":{freq:"週2回",note:"新梢伸長・適度に"},"5":{freq:"週2〜3回",note:"開花期・根元に"},"6":{freq:"週3回",note:"生理落果後・安定して"},"7":{freq:"週3〜4回",note:"果実肥大・高温注意"},"8":{freq:"週3〜4回",note:"夏・たっぷりと"},"9":{freq:"週2〜3回",note:"秋・適度に"},"10":{freq:"週2回",note:"果実肥大後期・控えめ"},"11":{freq:"週1〜2回",note:"収穫準備・控えめ"},"12":{freq:"週1回",note:"収穫後・休眠"}},
+      fertilizer:[{month:2,name:"寒肥",items:["油粕","骨粉"],note:"株元にすき込む"},{month:4,name:"芽出し肥",items:["化成肥料8:8:8"],note:"萌芽促進"},{month:6,name:"追肥（落果後）",items:["化成肥料8:8:8","マグマKファンプ"],note:"生理落果後の回復"},{month:9,name:"お礼肥",items:["化成肥料8:8:8"],note:"来年のために"}],
+    },
+  },
+  {
+    id:"apple_ourin", name:"リンゴ（王林）", emoji:"🍏", type:"果樹",
+    soil:"果樹用土（水はけ良く・弱酸性）", color:"#65a30d", colorLight:"#ecfccb", colorMid:"#a3e635",
+    fertilizers:["化成肥料8:8:8","油粕","骨粉","マグマKファンプ"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"休眠期・ほぼ断水"},"2":{freq:"週1回",note:"休眠期"},"3":{freq:"週1〜2回",note:"発芽前・徐々に"},"4":{freq:"週2回",note:"開花期・根元に丁寧に"},"5":{freq:"週2〜3回",note:"結実後・摘果時期"},"6":{freq:"週3回",note:"果実肥大期・たっぷり"},"7":{freq:"週3〜4回",note:"夏・高温乾燥注意"},"8":{freq:"週3〜4回",note:"着色始め・適度に"},"9":{freq:"週2〜3回",note:"収穫前・糖度UP"},"10":{freq:"週2〜3回",note:"王林収穫期（10〜11月）"},"11":{freq:"週1〜2回",note:"収穫後・控えめ"},"12":{freq:"週1回",note:"落葉・休眠"}},
+      fertilizer:[{month:2,name:"寒肥",items:["油粕","骨粉"],note:"休眠中に深くすき込む"},{month:4,name:"芽出し肥",items:["化成肥料8:8:8"],note:"開花前後"},{month:6,name:"追肥",items:["化成肥料8:8:8","マグマKファンプ"],note:"摘果後・肥大促進"},{month:9,name:"お礼肥",items:["化成肥料8:8:8"],note:"収穫前後の株回復"}],
+    },
+  },
+  {
+    id:"apple_fuji", name:"リンゴ（フジ）", emoji:"🍎", type:"果樹",
+    soil:"果樹用土（水はけ良く・弱酸性）", color:"#dc2626", colorLight:"#fee2e2", colorMid:"#f87171",
+    fertilizers:["化成肥料8:8:8","油粕","骨粉","マグマKファンプ"],
+    schedule:{
+      watering:{"1":{freq:"週1回",note:"休眠期・ほぼ断水"},"2":{freq:"週1回",note:"休眠期"},"3":{freq:"週1〜2回",note:"発芽前・徐々に"},"4":{freq:"週2回",note:"開花期・根元に丁寧に"},"5":{freq:"週2〜3回",note:"結実・摘果時期"},"6":{freq:"週3回",note:"果実肥大期・たっぷり"},"7":{freq:"週3〜4回",note:"夏・高温乾燥注意"},"8":{freq:"週3〜4回",note:"着色管理・葉摘み"},"9":{freq:"週2〜3回",note:"着色促進・袋外し"},"10":{freq:"週2〜3回",note:"収穫直前・やや控えめ"},"11":{freq:"週2回",note:"フジ収穫期（11月）・安定して"},"12":{freq:"週1回",note:"収穫後・落葉・休眠"}},
+      fertilizer:[{month:2,name:"寒肥",items:["油粕","骨粉"],note:"休眠中に深くすき込む"},{month:4,name:"芽出し肥",items:["化成肥料8:8:8"],note:"開花前後"},{month:6,name:"追肥",items:["化成肥料8:8:8","マグマKファンプ"],note:"摘果後・肥大促進"},{month:9,name:"着色肥",items:["マグマKファンプ"],note:"カリ多め・着色促進"},{month:11,name:"お礼肥",items:["化成肥料8:8:8","油粕"],note:"収穫後の株回復"}],
+    },
+  },
+];
+
+const ALL_FERTS       = ["マグマKファンプ","化成肥料8:8:8","油粕","骨粉"];
+const WEATHER_OPTIONS = ["晴れ☀️","曇り☁️","雨🌧️","雪❄️","強風💨"];
+const LOCATION_OPTIONS= ["室内🏠","ベランダ🪴"];
+const MONTH_JP        = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];
+
+const todayStr = () => new Date().toISOString().slice(0,10);
+const fmtDate  = d  => { const p=d.split("-"); return `${p[0]}年${parseInt(p[1])}月${parseInt(p[2])}日`; };
+const fmtTS    = ts => { const d=new Date(ts); return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`; };
+
+// ── Claude API ───────────────────────────────────────────────────────────────
+// ── Groq API helper ─────────────────────────────────────────────────────────
+async function groqChat(messages, model="llama-3.3-70b-versatile", maxTokens=1200) {
+  const key = localStorage.getItem("pcm_groq_key") || "";
+  if (!key) throw new Error("Groq APIキーが設定されていません");
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method:"POST",
+    headers:{"Content-Type":"application/json","Authorization":`Bearer ${key}`},
+    body: JSON.stringify({ model, max_tokens:maxTokens, messages })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(()=>({}));
+    throw new Error(err?.error?.message || `Groq API error ${res.status}`);
+  }
+  const d = await res.json();
+  return d.choices?.[0]?.message?.content || "";
+}
+
+// ── 写真差分分析（Groq vision） ──────────────────────────────────────────────
+async function analyzePhotoDiff(prev, curr, plantName) {
+  try {
+    const text = await groqChat([
+      { role:"system", content:"あなたは植物の生育管理アシスタントです。2枚の植物写真を比較して日本語で変化点を指摘してください。
+形式：
+【変化あり🌱】または【変化なし✓】
+・葉の色：
+・草丈・大きさ：
+・健康状態：
+・気になる点：
+・アドバイス：" },
+      { role:"user", content:[
+        {type:"text",text:`${plantName}の前回と今回の写真を比較してください。`},
+        {type:"image_url",image_url:{url:prev}},
+        {type:"text",text:"↑前回"},
+        {type:"image_url",image_url:{url:curr}},
+        {type:"text",text:"↑今回"},
+      ]}
+    ], "llama-3.2-90b-vision-preview", 1000);
+    return text || "分析結果を取得できませんでした";
+  } catch(e) { return `AI分析エラー: ${e.message}`; }
+}
+
+// ── 天気取得（Open-Meteo 無料API・キー不要） ────────────────────────────────
+const WEATHER_CODE_JP = {
+  0:"晴れ☀️",1:"ほぼ晴れ☀️",2:"一部曇り⛅",3:"曇り☁️",
+  45:"霧🌫️",48:"霧🌫️",51:"霧雨🌦️",53:"霧雨🌦️",55:"霧雨🌦️",
+  61:"小雨🌧️",63:"雨🌧️",65:"大雨🌧️",71:"小雪❄️",73:"雪❄️",75:"大雪❄️",
+  80:"にわか雨🌦️",81:"にわか雨🌦️",82:"強いにわか雨⛈️",
+  95:"雷雨⛈️",96:"雷雨⛈️",99:"激しい雷雨⛈️",
+};
+async function getWeatherInfo(location="東京") {
+  try {
+    // 1. 地名→緯度経度（Open-Meteo Geocoding）
+    const geoRes = await fetch(
+      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=ja&format=json`
+    );
+    const geo = await geoRes.json();
+    if (!geo.results?.length) return null;
+    const {latitude:lat, longitude:lon} = geo.results[0];
+
+    // 2. 天気取得（Open-Meteo）
+    const wRes = await fetch(
+      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+      `&daily=weathercode,temperature_2m_max,temperature_2m_min` +
+      `&timezone=Asia%2FTokyo&forecast_days=1`
+    );
+    const w = await wRes.json();
+    const code    = w.daily.weathercode[0];
+    const tempMax = Math.round(w.daily.temperature_2m_max[0]*10)/10;
+    const tempMin = Math.round(w.daily.temperature_2m_min[0]*10)/10;
+    const weather = WEATHER_CODE_JP[code] || "不明";
+    return { weather, tempMax, tempMin, advice:"" };
+  } catch { return null; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════════════════════
+// ── Shell: handles auth routing only ────────────────────────────────────────
+// ── Groq APIキー設定画面 ────────────────────────────────────────────────────
+function GroqKeyScreen({ onSave }) {
+  const [key, setKey] = useState("");
+  const [show, setShow] = useState(false);
+  return (
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(135deg,#0a1a0d,#1e3d1e)",fontFamily:"'Hiragino Sans',sans-serif",padding:20}}>
+      <div style={{background:"#fff",borderRadius:24,padding:"32px 24px",maxWidth:380,width:"100%",boxShadow:"0 20px 60px rgba(0,0,0,0.4)"}}>
+        <div style={{textAlign:"center",marginBottom:20}}>
+          <div style={{fontSize:40,marginBottom:8}}>⚡</div>
+          <div style={{fontSize:20,fontWeight:900,color:"#0a1a0d"}}>Groq API キー設定</div>
+          <div style={{fontSize:12,color:"#aaa",marginTop:6,lineHeight:1.6}}>
+            <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer"
+              style={{color:"#5a8a00",fontWeight:700}}>console.groq.com/keys</a> で無料取得できます
+          </div>
+        </div>
+        <div style={{position:"relative",marginBottom:12}}>
+          <input
+            type={show?"text":"password"}
+            placeholder="gsk_xxxxxxxxxxxxxxxxxxxx"
+            value={key}
+            onChange={e=>setKey(e.target.value)}
+            style={{width:"100%",padding:"12px 44px 12px 14px",border:"2px solid #e5e7eb",borderRadius:12,fontSize:14,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}}
+          />
+          <button onClick={()=>setShow(s=>!s)}
+            style={{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",cursor:"pointer",fontSize:18,color:"#aaa"}}>
+            {show?"🙈":"👁️"}
+          </button>
+        </div>
+        <button
+          onClick={()=>{if(key.trim().startsWith("gsk_")){localStorage.setItem("pcm_groq_key",key.trim());onSave();}else{alert("APIキーは gsk_ で始まる形式です");}}}
+          style={{width:"100%",padding:"13px",background:"linear-gradient(90deg,#5a8a00,#9dc31a)",color:"#fff",border:"none",borderRadius:12,fontWeight:800,fontSize:15,cursor:"pointer",fontFamily:"inherit",marginBottom:8}}>
+          ⚡ 保存してアプリを起動
+        </button>
+        <p style={{fontSize:11,color:"#bbb",textAlign:"center",margin:0,lineHeight:1.6}}>
+          キーはこのブラウザのみに保存されます（サーバー送信なし）
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [auth, setAuth] = useState(() => {
+    try { const s = sessionStorage.getItem(SESSION_KEY); return s ? JSON.parse(s) : null; } catch { return null; }
+  });
+  const [hasGroqKey, setHasGroqKey] = useState(()=>!!localStorage.getItem("pcm_groq_key"));
+
+  function doLogout() {
+    try { sessionStorage.removeItem(SESSION_KEY); } catch {}
+    setAuth(null);
+  }
+
+  // Groqキー未設定なら設定画面
+  if (!hasGroqKey) return <GroqKeyScreen onSave={()=>setHasGroqKey(true)} />;
+
+  if (!auth) return <AuthScreen onLogin={user => {
+    const session = { id:user.id, pw:user.pw, saltHex:user.saltHex, isAdmin:user.isAdmin, loginAt:Date.now() };
+    try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(session)); } catch {}
+    setAuth(session);
+  }} />;
+
+  return <PlantApp auth={auth} doLogout={doLogout} />;
+}
+
+
+// ── AI Advice from history（Groq） ───────────────────────────────────────────
+async function getAiAdvice(plantName, entriesSummary) {
+  try {
+    const today = new Date();
+    const monthName = `${today.getMonth()+1}月`;
+    const text = await groqChat([
+      { role:"system", content:`あなたは${plantName}の栽培専門家です。ユーザーの過去の管理記録を分析し、具体的な改善アドバイスを日本語で提供してください。現在は${monthName}です。` },
+      { role:"user",   content:`以下は${plantName}の最近の管理記録です：
+
+${entriesSummary}
+
+この記録を分析し、以下の形式でアドバイスしてください：
+
+【総合評価】
+【水やりについて】
+【肥料について】
+【気温・環境について】
+【今後のアドバイス（${monthName}のポイント）】` }
+    ], "llama-3.3-70b-versatile", 1200);
+    return text || "アドバイスを取得できませんでした";
+  } catch(e) { return `AI分析エラー: ${e.message}`; }
+}
+
+// ── Mini Bar Chart (no lib) ──────────────────────────────────────────────────
+function MiniBarChart({ data, color, height=60, unit="" }) {
+  if (!data.length) return <div style={{color:"#ccc",fontSize:12,padding:"8px 0"}}>データなし</div>;
+  const max = Math.max(...data.map(d=>d.val), 1);
+  return (
+    <div style={{display:"flex",alignItems:"flex-end",gap:3,height:height+24,paddingTop:4}}>
+      {data.map((d,i)=>(
+        <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+          <div style={{fontSize:9,color:color,fontWeight:700,visibility:d.val>0?"visible":"hidden"}}>{d.val}{unit}</div>
+          <div style={{width:"100%",background:d.val>0?color:"#f0f0f0",borderRadius:"3px 3px 0 0",height:d.val>0?Math.max(4,(d.val/max)*height):3,transition:"height .3s"}}/>
+          <div style={{fontSize:9,color:"#bbb",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",maxWidth:"100%"}}>{d.label}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Mini Line Chart (no lib) ─────────────────────────────────────────────────
+function MiniLineChart({ data, color, height=60 }) {
+  if (data.length < 2) return <div style={{color:"#ccc",fontSize:12,padding:"8px 0"}}>データなし（2件以上必要）</div>;
+  const vals = data.map(d=>parseFloat(d.val)||0);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const range = max - min || 1;
+  const w = 100, h = height;
+  const pts = vals.map((v,i)=>`${(i/(data.length-1))*w},${h-((v-min)/range)*h}`).join(" ");
+  return (
+    <div>
+      <svg viewBox={`0 0 ${w} ${h+4}`} style={{width:"100%",height:height+4,overflow:"visible"}}>
+        <polyline points={pts} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round"/>
+        {vals.map((v,i)=>(
+          <circle key={i} cx={(i/(data.length-1))*w} cy={h-((v-min)/range)*h} r="3" fill={color}/>
+        ))}
+      </svg>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#bbb",marginTop:2}}>
+        <span>{data[0]?.label}</span><span>{data[data.length-1]?.label}</span>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLANT APP
+// ═══════════════════════════════════════════════════════════════════════════════
+// Module-level location holder — completely outside React render cycle
+// This is the only reliable way to avoid IME issues with Japanese input
+let _locationValue = "東京";
+
+function PlantApp({ auth, doLogout }) {
+  const today        = new Date();
+  const currentMonth = String(today.getMonth()+1);
+
+  // Core state
+  const [plant,          setPlant]          = useState(PLANTS[0]);
+  const [tab,            setTab]            = useState("diary");
+  const [data,           setData]           = useState({});
+  const [loading,        setLoading]        = useState(true);
+  const [syncing,        setSyncing]        = useState(false);
+  const [modal,          setModal]          = useState(false);
+  const [viewing,        setViewing]        = useState(null);
+  const [imgViewer,      setImgViewer]      = useState(null);
+  const [toast,          setToast]          = useState(null);
+  const [decryptError,   setDecryptError]   = useState(false);
+  const [lockLog,        setLockLog]        = useState([]);
+
+  // Weather
+  const [weatherInfo,    setWeatherInfo]    = useState(null);
+  const [weatherLoading, setWeatherLoading] = useState(false);
+
+  // AI advice
+  const [aiAdvice,       setAiAdvice]       = useState(null);
+  const [aiAdviceLoading,setAiAdviceLoading]= useState(false);
+
+  // AI photo diff
+  const [aiDiffResult,   setAiDiffResult]   = useState(null);
+  const [aiDiffLoading,  setAiDiffLoading]  = useState(false);
+
+  // Alarm — screen-based (no browser API required)
+  const [alarmAm,        setAlarmAm]        = useState("06:00");
+  const [alarmPm,        setAlarmPm]        = useState("18:00");
+  const [alarmActive,    setAlarmActive]    = useState(false);
+  const [alarmMsg,       setAlarmMsg]       = useState(null);
+  const alarmRef = useRef(null);
+
+  // 一括水やり
+  const [bulkOpen,       setBulkOpen]       = useState(false);
+  const [bulkSelected,   setBulkSelected]   = useState([]);  // plant ids
+  const [bulkTime,       setBulkTime]       = useState("am"); // "am"|"pm"
+
+  // Graph
+  const [graphView,      setGraphView]      = useState("week"); // day|week|month
+
+  // Form state
+  const [entryDate,   setEntryDate]   = useState(todayStr());
+  // null=未記録, true=した, false=しなかった
+  const [waterAm,     setWaterAm]     = useState(null);
+  const [waterPm,     setWaterPm]     = useState(null);
+  const [waterNote,   setWaterNote]   = useState("");
+  // null=未記録, true=した, false=しなかった
+  const [fertilized,  setFertilized]  = useState(null);
+  const [fertItems,   setFertItems]   = useState([]); // [{name, amount}]
+  const [fertNote,    setFertNote]    = useState("");
+  // ── 共通情報（天候・外気温・室温）— shared__YYYY-MM-DD に保存
+  const [sharedWeatherAm,  setSharedWeatherAm]  = useState("");
+  const [sharedWeatherPm,  setSharedWeatherPm]  = useState("");
+  const [sharedTempMax,    setSharedTempMax]    = useState("");
+  const [sharedTempMin,    setSharedTempMin]    = useState("");
+  const [sharedRoomMorn,   setSharedRoomMorn]   = useState("");
+  const [sharedRoomNoon,   setSharedRoomNoon]   = useState("");
+  const [sharedRoomEve,    setSharedRoomEve]    = useState("");
+  const [sharedSaving,     setSharedSaving]     = useState(false);
+  const [locAm,       setLocAm]       = useState(""); // 午前の管理場所
+  const [locPm,       setLocPm]       = useState(""); // 午後の管理場所
+  const [memo,        setMemo]        = useState("");
+  const [photos,      setPhotos]      = useState([]);
+  const fileRef = useRef();
+
+  const C = { g:plant.color, l:plant.colorLight, m:plant.colorMid };
+
+  // Tab-close → clear session
+  useEffect(() => {
+    const clear = () => { try { sessionStorage.removeItem(SESSION_KEY); } catch {} };
+    window.addEventListener("beforeunload", clear);
+    document.addEventListener("visibilitychange", () => { if (document.visibilityState==="hidden") clear(); });
+    return () => window.removeEventListener("beforeunload", clear);
+  }, []);
+
+  // Load encrypted data
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      const result = await loadEncryptedData(auth.pw, auth.saltHex);
+      if (result === null) { setDecryptError(true); setLoading(false); return; }
+      setData(result);
+      // 今日の共通情報を復元
+      const todayShared = result["shared__"+new Date().toISOString().slice(0,10)] || {};
+      if (todayShared.weather) {
+        setSharedWeatherAm(todayShared.weather.am||"");
+        setSharedWeatherPm(todayShared.weather.pm||"");
+      }
+      if (todayShared.temp) {
+        setSharedTempMax(todayShared.temp.max||"");
+        setSharedTempMin(todayShared.temp.min||"");
+      }
+      if (todayShared.roomTemp) {
+        setSharedRoomMorn(todayShared.roomTemp.morn||"");
+        setSharedRoomNoon(todayShared.roomTemp.noon||"");
+        setSharedRoomEve(todayShared.roomTemp.eve||"");
+      }
+      if (auth.isAdmin) { const log = await loadLockLog(); setLockLog(log); }
+      setLoading(false);
+    })();
+  }, []);
+
+  // Alarm ticker — checks every 30 seconds
+  useEffect(() => {
+    if (!alarmActive) { if (alarmRef.current) clearInterval(alarmRef.current); return; }
+    alarmRef.current = setInterval(() => {
+      const now = new Date();
+      const hm  = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}`;
+      if (hm === alarmAm || hm === alarmPm) {
+        const time = hm === alarmAm ? "朝" : "夕";
+        setAlarmMsg(`⏰ ${time}の水やり時間です！ (${plant.name})`);
+        setTimeout(() => setAlarmMsg(null), 30000);
+      }
+    }, 30000);
+    return () => clearInterval(alarmRef.current);
+  }, [alarmActive, alarmAm, alarmPm, plant]);
+
+  const showToast = (msg, type="success") => { setToast({msg,type}); setTimeout(()=>setToast(null),3500); };
+  const eKey = (pid, date) => `${pid}__${date}`;
+
+  const allEntries = Object.entries(data)
+    .filter(([k])=>k.startsWith(plant.id+"__"))
+    .map(([k,v])=>({date:k.split("__")[1],...v}))
+    .sort((a,b)=>b.date.localeCompare(a.date));
+
+  // shared__ エントリ（天候・外気温・室温）— 日付をキーにしたマップ
+  const sharedEntries = Object.entries(data)
+    .filter(([k])=>k.startsWith("shared__"))
+    .reduce((acc,[k,v])=>{ acc[k.replace("shared__","")]=v; return acc; }, {});
+  const todaySharedEntry = sharedEntries[todayStr()] || {};
+
+  const todayEntry    = data[eKey(plant.id, todayStr())];
+  const prevPhotoEntry= allEntries.find(e=>e.date!==todayStr()&&e.photos?.length>0);
+
+  // ── Entry modal helpers ───────────────────────────────────────────────────────
+  function openModal(date=todayStr()) {
+    const ex = data[eKey(plant.id,date)] || {};
+    setEntryDate(date);
+    setWaterAm(ex.waterAm??null); setWaterPm(ex.waterPm??null); setWaterNote(ex.waterNote||"");
+    setFertilized(ex.fertilized??null); setFertItems(ex.fertItems||[]); setFertNote(ex.fertNote||"");
+    setLocAm(ex.locAm||ex.location||""); setLocPm(ex.locPm||"");
+    setMemo(ex.memo||""); setPhotos(ex.photos||[]);
+    // Sync IME drafts to loaded values
+    imeWaterNote.reset(ex.waterNote||"");
+    imeFertNote.reset(ex.fertNote||"");
+    imeMemo.reset(ex.memo||"");
+    setAiDiffResult(null); setModal(true);
+  }
+
+  async function saveEntry() {
+    setSyncing(true);
+    const entry = {
+      waterAm, waterPm, waterNote,
+      watered: waterAm===true || waterPm===true,
+      fertilized, fertItems, fertNote, // fertItems: [{name, amount}]
+      locAm, locPm, location:locAm||(locPm?"":"")||"", memo, photos,
+      savedBy:auth.id, updatedAt:new Date().toISOString(),
+    };
+    const newData = {...data,[eKey(plant.id,entryDate)]:entry};
+    setData(newData);
+    await saveEncryptedData(newData, auth.pw, auth.saltHex);
+    setSyncing(false); setModal(false);
+    showToast("✅ 暗号化して保存・同期しました 🔐");
+  }
+
+  // 共通情報保存
+  async function saveSharedEntry() {
+    setSharedSaving(true);
+    const td = todayStr();
+    const entry = {
+      weather: {am:sharedWeatherAm, pm:sharedWeatherPm},
+      temp:    {max:sharedTempMax,  min:sharedTempMin},
+      roomTemp:{morn:sharedRoomMorn,noon:sharedRoomNoon,eve:sharedRoomEve},
+      updatedAt: new Date().toISOString(),
+    };
+    const newData = {...data, [`shared__${td}`]: entry};
+    setData(newData);
+    await saveEncryptedData(newData, auth.pw, auth.saltHex);
+    setSharedSaving(false);
+    showToast("✅ 共通情報を保存しました");
+  }
+
+  // 一括水やり保存
+  async function saveBulkWater() {
+    if (!bulkSelected.length) { showToast("植物を選択してください","error"); return; }
+    setSyncing(true);
+    const td = todayStr();
+    let newData = {...data};
+    for (const pid of bulkSelected) {
+      const k = `${pid}__${td}`;
+      const ex = newData[k] || {};
+      newData[k] = {
+        ...ex,
+        [bulkTime==="am"?"waterAm":"waterPm"]: true,
+        watered: true,
+        savedBy: auth.id,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+    setData(newData);
+    await saveEncryptedData(newData, auth.pw, auth.saltHex);
+    setSyncing(false);
+    setBulkOpen(false);
+    setBulkSelected([]);
+    const names = PLANTS.filter(p=>bulkSelected.includes(p.id)).map(p=>p.name).join("・");
+    showToast(`✅ ${names}に${bulkTime==="am"?"朝":"夕"}水やりを記録しました`);
+  }
+
+  function handleFiles(e) {
+    Array.from(e.target.files).forEach(f=>{
+      const r=new FileReader();
+      r.onload=ev=>setPhotos(prev=>[...prev,{dataUrl:ev.target.result,caption:""}]);
+      r.readAsDataURL(f);
+    });
+    e.target.value="";
+  }
+
+  async function runAiDiff() {
+    if (!photos.length) { showToast("写真を追加してください","error"); return; }
+    if (!prevPhotoEntry?.photos?.length) { showToast("比較できる前回の写真がありません","error"); return; }
+    setAiDiffLoading(true);
+    const result = await analyzePhotoDiff(prevPhotoEntry.photos[0].dataUrl, photos[0].dataUrl, plant.name);
+    setAiDiffResult(result); setAiDiffLoading(false);
+  }
+
+  async function fetchWeather() {
+    setWeatherLoading(true);
+    const info = await getWeatherInfo(_locationValue.trim() || "東京");
+    setWeatherInfo(info);
+    setWeatherLoading(false);
+    if (info) {
+      // 取得と同時に共通情報へ自動反映
+      if (info.weather)  setSharedWeatherAm(info.weather);
+      if (info.tempMax != null) setSharedTempMax(String(info.tempMax));
+      if (info.tempMin != null) setSharedTempMin(String(info.tempMin));
+      showToast("☀️ 天気を取得・外気温を自動反映しました");
+    } else {
+      showToast("天気情報の取得に失敗しました","error");
+    }
+  }
+
+  async function fetchAiAdvice() {
+    setAiAdviceLoading(true);
+    const recent = allEntries.slice(0,14).map(e=>`
+日付:${e.date} 朝水やり:${e.waterAm===true?"○":e.waterAm===false?"×":"–"} 夕水やり:${e.waterPm===true?"○":e.waterPm===false?"×":"–"} 肥料:${e.fertilized===true?"○("+(e.fertItems?.map(f=>typeof f==="object"?`${f.name}${f.amount?" "+f.amount+"g":""}`:f).join(","))+")" :e.fertilized===false?"×":"–"} 外気温:${sharedEntries[e.date]?.temp?.max||"-"}/${sharedEntries[e.date]?.temp?.min||"-"}℃ 室温朝:${sharedEntries[e.date]?.roomTemp?.morn||"-"}℃ 昼:${sharedEntries[e.date]?.roomTemp?.noon||"-"}℃ 晩:${sharedEntries[e.date]?.roomTemp?.eve||"-"}℃ 天候:${sharedEntries[e.date]?.weather?.am||"-"}/${sharedEntries[e.date]?.weather?.pm||"-"} 午前場所:${e.locAm||e.location||"-"} 午後場所:${e.locPm||"-"} メモ:${e.memo||"-"}`).join("\n");
+    const advice = await getAiAdvice(plant.name, recent || "記録なし");
+    setAiAdvice(advice); setAiAdviceLoading(false);
+  }
+
+  // ── Graph data builders ───────────────────────────────────────────────────────
+  function buildGraphData(view) {
+    const sorted = [...allEntries].sort((a,b)=>a.date.localeCompare(b.date));
+    if (view==="day") {
+      const recent = sorted.slice(-14);
+      const waterAm  = recent.map(e=>({label:e.date.slice(5),val:e.waterAm===true?1:0}));
+      const waterPm  = recent.map(e=>({label:e.date.slice(5),val:e.waterPm===true?1:0}));
+      const fert     = recent.map(e=>({label:e.date.slice(5),val:e.fertilized===true?1:0}));
+      const tempMaxD = recent.map(e=>({label:e.date.slice(5),val:parseFloat(sharedEntries[e.date]?.temp?.max)||0}));
+      const tempMinD = recent.map(e=>({label:e.date.slice(5),val:parseFloat(sharedEntries[e.date]?.temp?.min)||0}));
+      const roomMorn = recent.map(e=>({label:e.date.slice(5),val:parseFloat(sharedEntries[e.date]?.roomTemp?.morn)||0}));
+      const roomNoon = recent.map(e=>({label:e.date.slice(5),val:parseFloat(sharedEntries[e.date]?.roomTemp?.noon)||0}));
+      const roomEve  = recent.map(e=>({label:e.date.slice(5),val:parseFloat(sharedEntries[e.date]?.roomTemp?.eve)||0}));
+      return {waterAm,waterPm,fert,tempMaxD,tempMinD,roomMorn,roomNoon,roomEve};
+    }
+    if (view==="week") {
+      const weeks = {};
+      sorted.forEach(e=>{
+        const d=new Date(e.date), day=d.getDay();
+        const mon=new Date(d); mon.setDate(d.getDate()-(day===0?6:day-1));
+        const k=mon.toISOString().slice(0,10);
+        if (!weeks[k]) weeks[k]={waterAm:0,waterPm:0,fert:0,count:0,tempMax:[],tempMin:[],roomMorn:[],roomNoon:[],roomEve:[]};
+        const w=weeks[k];
+        if (e.waterAm===true) w.waterAm++; if (e.waterPm===true) w.waterPm++;
+        if (e.fertilized===true) w.fert++;
+        w.count++;
+        const sd = sharedEntries[e.date]||{};
+        if (sd.temp?.max) w.tempMax.push(parseFloat(sd.temp.max));
+        if (sd.temp?.min) w.tempMin.push(parseFloat(sd.temp.min));
+        if (sd.roomTemp?.morn) w.roomMorn.push(parseFloat(sd.roomTemp.morn));
+        if (sd.roomTemp?.noon) w.roomNoon.push(parseFloat(sd.roomTemp.noon));
+        if (sd.roomTemp?.eve)  w.roomEve.push(parseFloat(sd.roomTemp.eve));
+      });
+      const wks = Object.entries(weeks).slice(-8);
+      const avg = arr => arr.length ? Math.round(arr.reduce((a,b)=>a+b,0)/arr.length*10)/10 : 0;
+      const lbl = k => k.slice(5).replace("-","/")+"〜";
+      return {
+        waterAm: wks.map(([k,v])=>({label:lbl(k),val:v.waterAm})),
+        waterPm: wks.map(([k,v])=>({label:lbl(k),val:v.waterPm})),
+        fert:    wks.map(([k,v])=>({label:lbl(k),val:v.fert})),
+        tempMaxD:wks.map(([k,v])=>({label:lbl(k),val:avg(v.tempMax)})),
+        tempMinD:wks.map(([k,v])=>({label:lbl(k),val:avg(v.tempMin)})),
+        roomMorn:wks.map(([k,v])=>({label:lbl(k),val:avg(v.roomMorn)})),
+        roomNoon:wks.map(([k,v])=>({label:lbl(k),val:avg(v.roomNoon)})),
+        roomEve: wks.map(([k,v])=>({label:lbl(k),val:avg(v.roomEve)})),
+      };
+    }
+    // month
+    const months = {};
+    sorted.forEach(e=>{
+      const k=e.date.slice(0,7);
+      if (!months[k]) months[k]={waterAm:0,waterPm:0,fert:0,tempMax:[],tempMin:[],roomMorn:[],roomNoon:[],roomEve:[]};
+      const m=months[k];
+      if (e.waterAm===true) m.waterAm++; if (e.waterPm===true) m.waterPm++;
+      if (e.fertilized===true) m.fert++;
+      const sdm = sharedEntries[e.date]||{};
+      if (sdm.temp?.max) m.tempMax.push(parseFloat(sdm.temp.max));
+      if (sdm.temp?.min) m.tempMin.push(parseFloat(sdm.temp.min));
+      if (sdm.roomTemp?.morn) m.roomMorn.push(parseFloat(sdm.roomTemp.morn));
+      if (sdm.roomTemp?.noon) m.roomNoon.push(parseFloat(sdm.roomTemp.noon));
+      if (sdm.roomTemp?.eve)  m.roomEve.push(parseFloat(sdm.roomTemp.eve));
+    });
+    const avg = arr => arr.length ? Math.round(arr.reduce((a,b)=>a+b,0)/arr.length*10)/10 : 0;
+    const mths = Object.entries(months).slice(-12);
+    return {
+      waterAm: mths.map(([k,v])=>({label:k.slice(5)+"月",val:v.waterAm})),
+      waterPm: mths.map(([k,v])=>({label:k.slice(5)+"月",val:v.waterPm})),
+      fert:    mths.map(([k,v])=>({label:k.slice(5)+"月",val:v.fert})),
+      tempMaxD:mths.map(([k,v])=>({label:k.slice(5)+"月",val:avg(v.tempMax)})),
+      tempMinD:mths.map(([k,v])=>({label:k.slice(5)+"月",val:avg(v.tempMin)})),
+      roomMorn:mths.map(([k,v])=>({label:k.slice(5)+"月",val:avg(v.roomMorn)})),
+      roomNoon:mths.map(([k,v])=>({label:k.slice(5)+"月",val:avg(v.roomNoon)})),
+      roomEve: mths.map(([k,v])=>({label:k.slice(5)+"月",val:avg(v.roomEve)})),
+    };
+  }
+
+  // ── Styles ────────────────────────────────────────────────────────────────────
+  const s = {
+    app:   { minHeight:"100vh", background:"linear-gradient(160deg,#f0faf2,#e8f5e9)", fontFamily:"'Hiragino Sans','Noto Sans JP',sans-serif", paddingBottom:100 },
+    hdr:   { background:`linear-gradient(135deg,#0a1a0d,${C.g})`, color:"#fff", padding:"14px 16px 0", position:"sticky", top:0, zIndex:50, boxShadow:"0 4px 24px rgba(0,0,0,0.28)" },
+    htitle:{ fontSize:19, fontWeight:900, margin:0 },
+    hsub:  { fontSize:10, opacity:0.55, marginTop:1, fontFamily:"monospace" },
+    sbadge:{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11, background:"rgba(255,255,255,0.14)", borderRadius:20, padding:"3px 10px", marginTop:6 },
+    ptabs: { display:"flex", flexWrap:"wrap", gap:6, marginTop:10, paddingBottom:10 },
+    ptab:  a=>({ padding:"7px 10px", borderRadius:20, border:"none", cursor:"pointer", fontSize:12, fontWeight:a?900:400, background:a?C.m:"rgba(255,255,255,0.18)", color:"#fff", fontFamily:"inherit", whiteSpace:"nowrap" }),
+    nav:   { display:"flex", background:"#fff", borderBottom:`2px solid ${C.l}`, position:"sticky", top:112, zIndex:40, boxShadow:"0 2px 8px rgba(0,0,0,0.04)", overflowX:"auto" },
+    navBtn:a=>({ flexShrink:0, padding:"11px 10px", border:"none", background:"none", cursor:"pointer", fontSize:11, color:a?C.g:"#bbb", fontWeight:a?900:400, borderBottom:a?`2.5px solid ${C.g}`:"2.5px solid transparent", marginBottom:-2, fontFamily:"inherit" }),
+    wrap:  { padding:14 },
+    card:  { background:"#fff", borderRadius:18, padding:"14px 16px", marginBottom:12, boxShadow:"0 2px 12px rgba(0,0,0,0.06)", border:`1px solid ${C.l}` },
+    ct:    { fontSize:11, fontWeight:800, color:"#aaa", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:10 },
+    badge: { display:"inline-block", background:C.g, color:"#fff", borderRadius:20, padding:"5px 16px", fontSize:14, fontWeight:800 },
+    pill:  (on,c)=>({ padding:"5px 11px", borderRadius:20, fontSize:12, fontWeight:700, background:on?c:"#eee", color:on?"#fff":"#ccc", whiteSpace:"nowrap" }),
+    inp:   { width:"100%", padding:"10px 12px", border:`2px solid ${C.l}`, borderRadius:10, fontSize:14, fontFamily:"inherit", boxSizing:"border-box", outline:"none", background:"#fafffe" },
+    tinp:  { flex:1, textAlign:"center", padding:"10px 4px", border:`2px solid ${C.l}`, borderRadius:10, fontSize:15, fontWeight:700, outline:"none", fontFamily:"inherit", background:"#fafffe" },
+    tBtn:  on=>({ flex:1, padding:11, border:`2px solid ${on?C.g:C.l}`, borderRadius:12, background:on?C.l:"#fafafa", color:on?C.g:"#ccc", fontWeight:800, fontSize:13, cursor:"pointer", fontFamily:"inherit" }),
+    chip:  on=>({ padding:"7px 13px", borderRadius:20, border:`2px solid ${on?C.g:C.l}`, background:on?C.l:"#fafafa", color:on?C.g:"#ccc", fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"inherit" }),
+    wchip: sel=>({ padding:"7px 8px", borderRadius:12, border:`2px solid ${sel?C.g:C.l}`, background:sel?C.l:"#fafafa", color:sel?C.g:"#aaa", fontWeight:700, fontSize:12, cursor:"pointer", fontFamily:"inherit", flex:1, textAlign:"center" }),
+    saveBtn:{ width:"100%", padding:14, background:`linear-gradient(90deg,${C.g},${C.m})`, color:"#fff", border:"none", borderRadius:14, fontSize:16, fontWeight:800, cursor:"pointer", fontFamily:"inherit", marginTop:12, boxShadow:`0 4px 16px ${C.g}55` },
+    fab:   { position:"fixed", bottom:24, right:20, width:60, height:60, borderRadius:"50%", background:`linear-gradient(135deg,${C.g},${C.m})`, color:"#fff", border:"none", fontSize:32, cursor:"pointer", boxShadow:`0 4px 24px ${C.g}88`, display:"flex", alignItems:"center", justifyContent:"center", zIndex:60 },
+    overlay:{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", zIndex:70 },
+    sheet: { position:"fixed", top:0, left:0, right:0, bottom:0, background:"#f8fdf9", zIndex:80, overflowY:"auto", WebkitOverflowScrolling:"touch", paddingBottom:40 },
+    label: { fontSize:13, fontWeight:800, color:"#444", marginBottom:6, display:"block", marginTop:14 },
+    aiBubble:{ background:"linear-gradient(135deg,#f0fdf4,#e6f7ec)", border:`1.5px solid ${C.m}`, borderRadius:14, padding:"12px 14px", marginTop:10, fontSize:13, lineHeight:1.8, color:"#1a3a1f", whiteSpace:"pre-wrap" },
+    toast: t=>({ position:"fixed", bottom:100, left:"50%", transform:"translateX(-50%)", background:t==="error"?"#dc2626":C.g, color:"#fff", padding:"10px 20px", borderRadius:24, fontSize:13, fontWeight:700, zIndex:200, boxShadow:"0 4px 20px rgba(0,0,0,0.2)", whiteSpace:"nowrap", maxWidth:"90vw", textAlign:"center" }),
+    alarmBanner:{ position:"fixed", top:0, left:0, right:0, background:`linear-gradient(90deg,#f59e0b,#d97706)`, color:"#fff", padding:"14px 20px", zIndex:300, fontSize:16, fontWeight:800, textAlign:"center", boxShadow:"0 4px 20px rgba(0,0,0,0.3)", display:"flex", justifyContent:"space-between", alignItems:"center" },
+  };
+
+  // ── Sub-components ────────────────────────────────────────────────────────────
+  function Pills({e}) {
+    const watered = e.waterAm || e.waterPm || e.watered;
+    return (
+      <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:6}}>
+        <span style={s.pill(e.waterAm===true,"#3b82f6")}>{e.waterAm===true?"💧朝✓":e.waterAm===false?"🚫朝":"💧朝–"}</span>
+        <span style={s.pill(e.waterPm===true,"#0ea5e9")}>{e.waterPm===true?"💧夕✓":e.waterPm===false?"🚫夕":"💧夕–"}</span>
+        <span style={s.pill(e.fertilized===true,C.g)}>{e.fertilized===true?"🌱施肥✓":e.fertilized===false?"🌱なし":"🌱–"}</span>
+        {e.location&&<span style={s.pill(true,"#64748b")}>📍{e.location}</span>}
+        {e.photos?.length>0&&<span style={s.pill(true,"#8b5cf6")}>📷{e.photos.length}</span>}
+      </div>
+    );
+  }
+
+  function TempDisp({temp,roomTemp}) {
+    const ho = temp?.max||temp?.min||temp?.morn;
+    const hr = roomTemp?.morn||roomTemp?.noon||roomTemp?.eve;
+    if (!ho&&!hr) return null;
+    return (
+      <div style={{marginTop:6}}>
+        {ho&&<div style={{display:"flex",gap:3,marginBottom:4}}>
+          {[["最高",temp?.max,"#ef4444"],["最低",temp?.min,"#3b82f6"],["朝",temp?.morn,"#64748b"],["昼",temp?.noon,"#f59e0b"],["晩",temp?.eve,"#6366f1"]].map(([l,v,c])=>
+            v?<div key={l} style={{flex:1,textAlign:"center",background:"#f8f8f8",borderRadius:8,padding:"5px 2px"}}>
+              <div style={{fontSize:9,color:"#aaa"}}>{l}</div>
+              <div style={{fontSize:14,fontWeight:800,color:c}}>{v}°</div>
+            </div>:null
+          )}
+        </div>}
+        {hr&&<div style={{display:"flex",gap:3}}>
+          {[["室温朝",roomTemp?.morn],["室温昼",roomTemp?.noon],["室温晩",roomTemp?.eve]].map(([l,v])=>
+            v?<div key={l} style={{flex:1,textAlign:"center",background:"#fffbf0",borderRadius:8,padding:"5px 2px",border:"1px solid #fde68a"}}>
+              <div style={{fontSize:9,color:"#aaa"}}>{l}</div>
+              <div style={{fontSize:14,fontWeight:800,color:"#d97706"}}>{v}°</div>
+            </div>:null
+          )}
+        </div>}
+      </div>
+    );
+  }
+
+  // ── DIARY TAB ──────────────────────────────────────────────────────────────────
+  const DiaryTab = () => (
+    <div style={s.wrap}>
+      {/* Alarm banner */}
+      {alarmMsg && (
+        <div style={s.alarmBanner}>
+          <span>{alarmMsg}</span>
+          <button onClick={()=>setAlarmMsg(null)} style={{background:"none",border:"none",color:"#fff",fontSize:20,cursor:"pointer"}}>✕</button>
+        </div>
+      )}
+
+      {/* Alarm setup */}
+      <div style={s.card}>
+        <div style={s.ct}>⏰ 水やりアラーム（朝・夕）</div>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:8}}>
+          <div style={{flex:1}}>
+            <div style={{fontSize:11,color:"#aaa",marginBottom:3}}>🌅 朝</div>
+            <input type="time" value={alarmAm} onChange={e=>setAlarmAm(e.target.value)} style={{...s.inp,padding:"8px 10px",fontSize:14,fontWeight:700}}/>
+          </div>
+          <div style={{flex:1}}>
+            <div style={{fontSize:11,color:"#aaa",marginBottom:3}}>🌇 夕</div>
+            <input type="time" value={alarmPm} onChange={e=>setAlarmPm(e.target.value)} style={{...s.inp,padding:"8px 10px",fontSize:14,fontWeight:700}}/>
+          </div>
+          <button onClick={()=>{setAlarmActive(a=>!a);showToast(alarmActive?"アラームをOFFにしました":"⏰ アラームをONにしました");}}
+            style={{padding:"10px 14px",background:alarmActive?C.g:"#64748b",color:"#fff",border:"none",borderRadius:10,fontWeight:800,fontSize:13,cursor:"pointer",fontFamily:"inherit",marginTop:14,whiteSpace:"nowrap"}}>
+            {alarmActive?"🔔 ON":"🔕 OFF"}
+          </button>
+        </div>
+        <p style={{fontSize:11,color:"#aaa",margin:0}}>※ アプリを開いている間、画面内に通知を表示します（ブラウザ許可不要）</p>
+      </div>
+
+      {/* 一括水やり */}
+      <div style={s.card}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:bulkOpen?10:0}}>
+          <div style={s.ct} style={{margin:0}}>💧 一括水やり記録</div>
+          <button onClick={()=>setBulkOpen(o=>!o)}
+            style={{padding:"6px 14px",background:bulkOpen?C.g:"#f0f0f0",color:bulkOpen?"#fff":"#666",border:"none",borderRadius:8,fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
+            {bulkOpen?"▲ 閉じる":"▼ 開く"}
+          </button>
+        </div>
+        {bulkOpen&&(
+          <div>
+            <div style={{fontSize:12,color:"#666",marginBottom:8}}>同時に水やりした植物にチェックを入れてください</div>
+            {/* 朝/夕 選択 */}
+            <div style={{display:"flex",gap:6,marginBottom:10}}>
+              {[["am","🌅 朝"],["pm","🌇 夕"]].map(([v,l])=>(
+                <button key={v} onClick={()=>setBulkTime(v)}
+                  style={{flex:1,padding:"8px",border:`2px solid ${bulkTime===v?"#3b82f6":C.l}`,borderRadius:8,background:bulkTime===v?"#eff6ff":"#fafafa",color:bulkTime===v?"#3b82f6":"#aaa",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>
+                  {l}
+                </button>
+              ))}
+            </div>
+            {/* Plant checkboxes */}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:10}}>
+              {PLANTS.map(p=>{
+                const sel = bulkSelected.includes(p.id);
+                const todayRec = data[`${p.id}__${todayStr()}`];
+                const already = bulkTime==="am" ? todayRec?.waterAm===true : todayRec?.waterPm===true;
+                return (
+                  <button key={p.id} onClick={()=>setBulkSelected(prev=>sel?prev.filter(x=>x!==p.id):[...prev,p.id])}
+                    style={{padding:"8px 10px",border:`2px solid ${sel?C.g:already?"#fbbf24":C.l}`,borderRadius:10,background:sel?C.l:already?"#fffbeb":"#fafafa",cursor:"pointer",fontFamily:"inherit",textAlign:"left",display:"flex",alignItems:"center",gap:5}}>
+                    <span style={{fontSize:16}}>{sel?"☑️":"⬜"}</span>
+                    <span style={{fontSize:12,fontWeight:700,color:sel?C.g:already?"#92400e":"#555"}}>{p.emoji} {p.name}</span>
+                    {already&&<span style={{fontSize:10,color:"#92400e",marginLeft:"auto"}}>済</span>}
+                  </button>
+                );
+              })}
+            </div>
+            {/* 全選択・解除 */}
+            <div style={{display:"flex",gap:6,marginBottom:8}}>
+              <button onClick={()=>setBulkSelected(PLANTS.map(p=>p.id))}
+                style={{flex:1,padding:"6px",border:`1px solid ${C.l}`,borderRadius:6,background:C.l,color:C.g,fontWeight:700,fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>
+                全選択
+              </button>
+              <button onClick={()=>setBulkSelected([])}
+                style={{flex:1,padding:"6px",border:"1px solid #e5e7eb",borderRadius:6,background:"#fafafa",color:"#aaa",fontWeight:700,fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>
+                全解除
+              </button>
+            </div>
+            <button onClick={saveBulkWater} disabled={!bulkSelected.length||syncing}
+              style={{width:"100%",padding:"12px",background:bulkSelected.length&&!syncing?`linear-gradient(90deg,#3b82f6,#0ea5e9)`:"#e5e7eb",color:bulkSelected.length?"#fff":"#aaa",border:"none",borderRadius:10,fontWeight:800,fontSize:14,cursor:bulkSelected.length?"pointer":"not-allowed",fontFamily:"inherit"}}>
+              {syncing?"保存中…":`💧 ${bulkTime==="am"?"朝":"夕"}水やりを記録 (${bulkSelected.length}植物)`}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Weather fetch — IME fixed */}
+      <div style={s.card}>
+        <div style={s.ct}>🌤️ 今日の天気を取得</div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <input
+            key="location-input"
+            defaultValue={_locationValue}
+            onChange={e => { _locationValue = e.target.value; }}
+            placeholder="地域名（例：東京）"
+            style={{...s.inp,flex:1,padding:"8px 12px",fontSize:16}}
+          />
+          <button onClick={fetchWeather} disabled={weatherLoading}
+            style={{padding:"9px 14px",background:C.g,color:"#fff",border:"none",borderRadius:10,fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit",whiteSpace:"nowrap"}}>
+            {weatherLoading?"取得中…":"🔍 取得"}
+          </button>
+        </div>
+        {weatherInfo&&(
+          <div style={{marginTop:10,padding:"12px",background:C.l,borderRadius:12}}>
+            <div style={{fontSize:16,fontWeight:800,color:C.g}}>{weatherInfo.weather}</div>
+            <div style={{display:"flex",gap:12,marginTop:6,fontSize:14}}>
+              <span>🌡️最高 <strong style={{color:"#ef4444"}}>{weatherInfo.tempMax}°C</strong></span>
+              <span>🌡️最低 <strong style={{color:"#3b82f6"}}>{weatherInfo.tempMin}°C</strong></span>
+            </div>
+            {weatherInfo.advice&&<p style={{fontSize:12,color:"#555",marginTop:8,fontStyle:"italic",lineHeight:1.6}}>{weatherInfo.advice}</p>}
+          </div>
+        )}
+      </div>
+
+      {/* 共通情報カード（天候・外気温・室温） */}
+      <div style={s.card}>
+        <div style={s.ct}>🌡️ 今日の共通情報（全植物共通）</div>
+        <p style={{fontSize:11,color:"#aaa",margin:"0 0 10px"}}>天候・外気温・室温は1回だけ入力すれば全植物に反映されます</p>
+
+        {/* 天気取得から自動入力 */}
+        {weatherInfo&&(
+          <div style={{fontSize:11,color:C.g,background:C.l,borderRadius:8,padding:"6px 10px",marginBottom:10}}>
+            ✅ 天気取得済み — 外気温・天候を自動反映しました
+          </div>
+        )}
+
+        {/* 天候 */}
+        <div style={{marginBottom:10}}>
+          <div style={{fontSize:12,fontWeight:700,color:"#555",marginBottom:5}}>☁️ 天候</div>
+          <div style={{display:"flex",gap:6,marginBottom:5}}>
+            <span style={{fontSize:11,color:"#aaa",width:32,paddingTop:8}}>午前</span>
+            <div style={{display:"flex",gap:4,flexWrap:"wrap",flex:1}}>
+              {WEATHER_OPTIONS.map(w=><button key={w} style={s.wchip(sharedWeatherAm===w)} onClick={()=>setSharedWeatherAm(w===sharedWeatherAm?"":w)}>{w}</button>)}
+            </div>
+          </div>
+          <div style={{display:"flex",gap:6}}>
+            <span style={{fontSize:11,color:"#aaa",width:32,paddingTop:8}}>午後</span>
+            <div style={{display:"flex",gap:4,flexWrap:"wrap",flex:1}}>
+              {WEATHER_OPTIONS.map(w=><button key={w} style={s.wchip(sharedWeatherPm===w)} onClick={()=>setSharedWeatherPm(w===sharedWeatherPm?"":w)}>{w}</button>)}
+            </div>
+          </div>
+        </div>
+
+        {/* 外気温 */}
+        <div style={{marginBottom:10}}>
+          <div style={{fontSize:12,fontWeight:700,color:"#555",marginBottom:5}}>🌡️ 外気温（°C）</div>
+          <div style={{display:"flex",gap:8}}>
+            {[["最高🔴",sharedTempMax,setSharedTempMax],["最低🔵",sharedTempMin,setSharedTempMin]].map(([l,val,set])=>(
+              <div key={l} style={{flex:1,textAlign:"center"}}>
+                <div style={{fontSize:10,color:"#aaa",marginBottom:3}}>{l}</div>
+                <input
+                  key={l+"-"+val}
+                  type="text" inputMode="decimal" placeholder="—"
+                  defaultValue={val}
+                  onBlur={e=>set(e.target.value)}
+                  style={{...s.tinp,fontSize:16,width:"100%",boxSizing:"border-box"}}/>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* 室内気温 */}
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:12,fontWeight:700,color:"#555",marginBottom:5}}>🏠 室内気温（°C）</div>
+          <div style={{display:"flex",gap:6}}>
+            {[["朝",sharedRoomMorn,setSharedRoomMorn],["昼",sharedRoomNoon,setSharedRoomNoon],["晩",sharedRoomEve,setSharedRoomEve]].map(([l,val,set])=>(
+              <div key={l} style={{flex:1,textAlign:"center"}}>
+                <div style={{fontSize:10,color:"#aaa",marginBottom:3}}>{l}</div>
+                <input
+                  key={l+"-"+val}
+                  type="text" inputMode="decimal" placeholder="—"
+                  defaultValue={val}
+                  onBlur={e=>set(e.target.value)}
+                  style={{...s.tinp,border:"2px solid #fde68a",fontSize:16,width:"100%",boxSizing:"border-box"}}/>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <button onClick={saveSharedEntry} disabled={sharedSaving}
+          style={{width:"100%",padding:"11px",background:sharedSaving?"#ccc":`linear-gradient(90deg,${C.g},${C.m})`,color:"#fff",border:"none",borderRadius:10,fontWeight:800,fontSize:14,cursor:sharedSaving?"not-allowed":"pointer",fontFamily:"inherit"}}>
+          {sharedSaving?"保存中…":"💾 共通情報を保存"}
+        </button>
+      </div>
+
+      {/* AI Advice */}
+      <div style={s.card}>
+        <div style={s.ct}>🤖 AIアドバイス（記録＋ネット情報）</div>
+        <button onClick={fetchAiAdvice} disabled={aiAdviceLoading}
+          style={{width:"100%",padding:"11px",background:`linear-gradient(90deg,${C.g},${C.m})`,color:"#fff",border:"none",borderRadius:10,fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"inherit",marginBottom:8}}>
+          {aiAdviceLoading?"🔍 分析中（30秒ほどかかります）…":"🌿 過去の記録から総合アドバイスを生成"}
+        </button>
+        {aiAdvice&&<div style={s.aiBubble}>{aiAdvice}</div>}
+      </div>
+
+      {/* Today */}
+      <div style={{background:`linear-gradient(135deg,${C.l},#fff)`,borderRadius:18,padding:16,marginBottom:12,border:`2px solid ${C.m}`,boxShadow:`0 4px 20px ${C.g}22`}}>
+        <div style={{fontSize:16,fontWeight:900,color:C.g,marginBottom:8}}>📅 今日の記録</div>
+        {todayEntry?(
+          <>
+            <Pills e={todayEntry}/>
+            {(todaySharedEntry.weather?.am||todaySharedEntry.weather?.pm)&&<div style={{fontSize:12,color:"#888",marginBottom:4}}>☁️ 午前:{todaySharedEntry.weather.am||"–"} 午後:{todaySharedEntry.weather.pm||"–"}</div>}
+            <TempDisp temp={todaySharedEntry.temp} roomTemp={todaySharedEntry.roomTemp}/>
+            {todayEntry.photos?.length>0&&(
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:5,marginTop:8}}>
+                {todayEntry.photos.slice(0,4).map((p,i)=>(
+                  <img key={i} src={p.dataUrl} alt={p.caption} onClick={()=>setImgViewer(p)}
+                    style={{width:"100%",aspectRatio:"1",objectFit:"cover",borderRadius:10,cursor:"pointer",border:`2px solid ${C.m}`}}/>
+                ))}
+              </div>
+            )}
+            {todayEntry.memo&&<p style={{fontSize:13,color:"#555",marginTop:6,fontStyle:"italic"}}>📝 {todayEntry.memo}</p>}
+            <button onClick={()=>openModal(todayStr())} style={{marginTop:10,background:"none",border:`1.5px solid ${C.g}`,color:C.g,borderRadius:8,padding:"6px 14px",fontSize:13,cursor:"pointer",fontWeight:700,fontFamily:"inherit"}}>✏️ 編集</button>
+          </>
+        ):(
+          <p style={{color:"#bbb",fontSize:14,margin:0}}>まだ今日の記録がありません</p>
+        )}
+      </div>
+
+      {/* This month summary */}
+      <div style={s.card}>
+        <div style={s.ct}>📊 今月の実施状況</div>
+        {(() => {
+          const thisMonth = todayStr().slice(0,7);
+          const monthEntries = allEntries.filter(e=>e.date.startsWith(thisMonth));
+          const waterAmDays = monthEntries.filter(e=>e.waterAm===true).length;
+          const waterPmDays = monthEntries.filter(e=>e.waterPm===true).length;
+          const fertDays    = monthEntries.filter(e=>e.fertilized===true).length;
+          return (
+            <div style={{display:"flex",gap:8}}>
+              {[["💧朝水やり",waterAmDays,"#3b82f6"],["💧夕水やり",waterPmDays,"#0ea5e9"],["🌱肥料",fertDays,C.g]].map(([l,v,c])=>(
+                <div key={l} style={{flex:1,textAlign:"center",background:"#f8f8f8",borderRadius:12,padding:"12px 6px"}}>
+                  <div style={{fontSize:11,color:"#aaa",marginBottom:4}}>{l}</div>
+                  <div style={{fontSize:26,fontWeight:900,color:c}}>{v}</div>
+                  <div style={{fontSize:10,color:"#aaa"}}>日</div>
+                </div>
+              ))}
+            </div>
+          );
+        })()}
+      </div>
+
+      {/* Past entries */}
+      <div style={{fontSize:12,fontWeight:800,color:"#aaa",marginBottom:8,letterSpacing:"0.08em"}}>📋 過去の記録</div>
+      {allEntries.filter(e=>e.date!==todayStr()).map(e=>(
+        <div key={e.date} onClick={()=>setViewing(e)}
+          style={{background:"#fff",borderRadius:14,padding:"12px 14px",marginBottom:10,boxShadow:"0 2px 8px rgba(0,0,0,0.05)",border:`1px solid ${C.l}`,cursor:"pointer"}}>
+          <div style={{fontSize:12,color:"#aaa",marginBottom:5}}>{fmtDate(e.date)}</div>
+          <Pills e={e}/>
+          {e.photos?.length>0&&(
+            <div style={{display:"flex",gap:4,marginTop:6}}>
+              {e.photos.slice(0,4).map((p,i)=>(
+                <img key={i} src={p.dataUrl} alt="" style={{width:46,height:46,objectFit:"cover",borderRadius:8,border:`2px solid ${C.l}`}}/>
+              ))}
+              {e.photos.length>4&&<div style={{width:46,height:46,borderRadius:8,background:C.l,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:C.g}}>+{e.photos.length-4}</div>}
+            </div>
+          )}
+        </div>
+      ))}
+      {allEntries.length===0&&<p style={{color:"#ccc",textAlign:"center",marginTop:30,fontSize:14}}>記録がまだありません</p>}
+    </div>
+  );
+
+  // ── GRAPH TAB ─────────────────────────────────────────────────────────────────
+  const GraphTab = () => {
+    const gd = buildGraphData(graphView);
+    const viewLabel = {day:"日別（直近14日）",week:"週別（直近8週）",month:"月別（直近12ヶ月）"}[graphView];
+    return (
+      <div style={s.wrap}>
+        {/* View switcher */}
+        <div style={{display:"flex",gap:6,marginBottom:12}}>
+          {[["day","日別"],["week","週別"],["month","月別"]].map(([v,l])=>(
+            <button key={v} onClick={()=>setGraphView(v)}
+              style={{flex:1,padding:"9px 0",border:`2px solid ${graphView===v?C.g:C.l}`,borderRadius:10,background:graphView===v?C.l:"#fafafa",color:graphView===v?C.g:"#aaa",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>
+              {l}
+            </button>
+          ))}
+        </div>
+        <div style={{fontSize:12,color:"#aaa",marginBottom:12,textAlign:"center"}}>{viewLabel}</div>
+
+        {/* Water */}
+        <div style={s.card}>
+          <div style={s.ct}>💧 水やり回数</div>
+          <div style={{marginBottom:8}}>
+            <div style={{fontSize:12,color:"#3b82f6",fontWeight:700,marginBottom:4}}>🌅 朝水やり</div>
+            <MiniBarChart data={gd.waterAm} color="#3b82f6" unit="日"/>
+          </div>
+          <div>
+            <div style={{fontSize:12,color:"#0ea5e9",fontWeight:700,marginBottom:4}}>🌇 夕水やり</div>
+            <MiniBarChart data={gd.waterPm} color="#0ea5e9" unit="日"/>
+          </div>
+        </div>
+
+        {/* Fertilizer */}
+        <div style={s.card}>
+          <div style={s.ct}>🌱 肥料施肥回数</div>
+          <MiniBarChart data={gd.fert} color={C.g} unit="日"/>
+        </div>
+
+        {/* Outdoor temp */}
+        <div style={s.card}>
+          <div style={s.ct}>🌡️ 外気温（°C）</div>
+          <div style={{marginBottom:8}}>
+            <div style={{fontSize:12,color:"#ef4444",fontWeight:700,marginBottom:4}}>最高気温</div>
+            <MiniLineChart data={gd.tempMaxD} color="#ef4444"/>
+          </div>
+          <div>
+            <div style={{fontSize:12,color:"#3b82f6",fontWeight:700,marginBottom:4}}>最低気温</div>
+            <MiniLineChart data={gd.tempMinD} color="#3b82f6"/>
+          </div>
+        </div>
+
+        {/* Indoor temp */}
+        <div style={s.card}>
+          <div style={s.ct}>🏠 室内気温（°C）</div>
+          {[["室温・朝",gd.roomMorn,"#64748b"],["室温・昼",gd.roomNoon,"#f59e0b"],["室温・晩",gd.roomEve,"#6366f1"]].map(([l,d,c])=>(
+            <div key={l} style={{marginBottom:10}}>
+              <div style={{fontSize:12,color:c,fontWeight:700,marginBottom:4}}>{l}</div>
+              <MiniLineChart data={d} color={c}/>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  // ── SCHEDULE TAB ──────────────────────────────────────────────────────────────
+  const ScheduleTab = () => (
+    <div style={s.wrap}>
+      <div style={s.card}>
+        <div style={s.ct}>💧 月別 水やり頻度</div>
+        {Object.entries(plant.schedule.watering).map(([m,w])=>{
+          const cur=m===currentMonth;
+          return (
+            <div key={m} style={{borderRadius:12,padding:"10px 12px",marginBottom:6,background:cur?C.l:"#fafafa",border:cur?`2px solid ${C.g}`:"2px solid #f0f0f0"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:14,fontWeight:700}}>{cur&&"📍 "}{MONTH_JP[parseInt(m)-1]}</span>
+                <span style={{fontSize:14,fontWeight:800,color:C.g}}>{w.freq}</span>
+              </div>
+              <div style={{fontSize:12,color:"#888",marginTop:2}}>{w.note}</div>
+            </div>
+          );
+        })}
+      </div>
+      <div style={s.card}>
+        <div style={s.ct}>🌱 年間施肥スケジュール</div>
+        {plant.schedule.fertilizer.map((f,i)=>{
+          const past=f.month<parseInt(currentMonth),cur=f.month===parseInt(currentMonth);
+          return (
+            <div key={i} style={{borderRadius:12,padding:"12px",marginBottom:8,borderLeft:`4px solid ${cur?C.g:past?"#ddd":C.m}`,background:cur?C.l:"#fafafa",opacity:past?0.55:1}}>
+              <div style={{display:"flex",justifyContent:"space-between"}}>
+                <span style={{fontSize:12,color:"#888"}}>{f.month}月</span>
+                {cur&&<span style={{fontSize:11,color:C.g,fontWeight:800}}>👈 今月</span>}
+                {past&&<span style={{fontSize:11,color:"#aaa"}}>✅ 完了</span>}
+              </div>
+              <div style={{fontSize:15,fontWeight:800,color:"#333",marginTop:2}}>{f.name}</div>
+              <div style={{fontSize:12,color:"#555",marginTop:3}}>使用肥料：{f.items.join("、")}</div>
+              <div style={{fontSize:12,color:"#888",fontStyle:"italic",marginTop:2}}>{f.note}</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  // ── SECURITY TAB ──────────────────────────────────────────────────────────────
+  const SecurityTab = () => (
+    <div style={s.wrap}>
+      <div style={s.card}>
+        <div style={s.ct}>🔐 暗号化ステータス</div>
+        {[["暗号化方式","AES-256-GCM"],["鍵導出","PBKDF2 310,000回"],["ハッシュ","SHA-256"],["ソルト","256-bit（ユーザー毎）"],["ログイン中",auth.id],["権限",auth.isAdmin?"👑 管理者":"一般"]].map(([k,v])=>(
+          <div key={k} style={{display:"flex",padding:"8px 0",borderBottom:`1px solid ${C.l}`}}>
+            <span style={{fontSize:12,color:"#aaa",fontWeight:700,width:"45%"}}>{k}</span>
+            <span style={{fontSize:12,color:"#333",fontWeight:600}}>{v}</span>
+          </div>
+        ))}
+      </div>
+      {auth.isAdmin&&(
+        <div style={s.card}>
+          <div style={s.ct}>🔒 ロック・失敗履歴</div>
+          {lockLog.length===0
+            ?<p style={{color:"#aaa",fontSize:13}}>記録なし ✅</p>
+            :lockLog.map((l,i)=>(
+              <div key={i} style={{padding:"8px 10px",marginBottom:6,borderRadius:10,background:l.event==="LOCKOUT"?"#fff5f5":"#fffbeb",border:`1px solid ${l.event==="LOCKOUT"?"#fecaca":"#fde68a"}`}}>
+                <div style={{display:"flex",justifyContent:"space-between"}}>
+                  <span style={{fontSize:13,fontWeight:700,color:l.event==="LOCKOUT"?"#b91c1c":"#92400e"}}>{l.event==="LOCKOUT"?"🔒 ロック":"⚠️ 失敗"} {l.targetId}</span>
+                  <span style={{fontSize:11,color:"#aaa"}}>{fmtTS(l.timestamp)}</span>
+                </div>
+                <div style={{fontSize:12,color:"#666",marginTop:2}}>{l.reason}</div>
+              </div>
+            ))
+          }
+          {lockLog.length>0&&<button onClick={async()=>{await sSet(LOCK_LOG_KEY,[]);setLockLog([]);showToast("履歴を削除しました");}}
+            style={{marginTop:8,background:"none",border:"1.5px solid #fca5a5",color:"#dc2626",borderRadius:8,padding:"6px 14px",fontSize:12,cursor:"pointer",fontWeight:700,fontFamily:"inherit"}}>
+            🗑️ 履歴クリア
+          </button>}
+        </div>
+      )}
+    </div>
+  );
+
+  // ── DETAIL VIEW ───────────────────────────────────────────────────────────────
+  const DetailView = ({e}) => (
+    <>
+      <div style={{...s.overlay,zIndex:90}} onClick={()=>setViewing(null)}/>
+      <div style={{position:"fixed",inset:0,background:"#f0faf2",zIndex:100,overflowY:"auto",paddingBottom:40}}>
+        <div style={{background:`linear-gradient(135deg,#0a1a0d,${C.g})`,color:"#fff",padding:"18px 16px",display:"flex",alignItems:"center",gap:12}}>
+          <button onClick={()=>setViewing(null)} style={{background:"rgba(255,255,255,0.2)",border:"none",color:"#fff",borderRadius:"50%",width:36,height:36,fontSize:20,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>←</button>
+          <div>
+            <div style={{fontSize:18,fontWeight:900}}>{plant.emoji} {plant.name}</div>
+            <div style={{fontSize:13,opacity:0.7}}>{fmtDate(e.date)}</div>
+          </div>
+          <button onClick={()=>{setViewing(null);openModal(e.date);}} style={{marginLeft:"auto",background:"rgba(255,255,255,0.2)",border:"none",color:"#fff",borderRadius:8,padding:"6px 12px",fontSize:13,cursor:"pointer",fontWeight:700,fontFamily:"inherit"}}>✏️ 編集</button>
+        </div>
+        <div style={{padding:16}}>
+          <div style={{...s.card,borderLeft:`4px solid #3b82f6`}}>
+            <div style={s.ct}>💧 水やり</div>
+            <div style={{display:"flex",gap:8}}>
+              <span style={s.pill(e.waterAm,"#3b82f6")}>朝 {e.waterAm?"✅":"×"}</span>
+              <span style={s.pill(e.waterPm,"#0ea5e9")}>夕 {e.waterPm?"✅":"×"}</span>
+            </div>
+            {e.waterNote&&<p style={{fontSize:13,color:"#666",fontStyle:"italic",marginTop:6}}>{e.waterNote}</p>}
+          </div>
+          <div style={{...s.card,borderLeft:e.fertilized?`4px solid ${C.g}`:"4px solid #ddd"}}>
+            <div style={s.ct}>🌱 肥料</div>
+            <div style={{fontSize:15,fontWeight:700,color:e.fertilized===true?C.g:e.fertilized===false?"#94a3b8":"#ccc"}}>{e.fertilized===true?"✅ 実施":e.fertilized===false?"— しなかった":"— 未記録"}</div>
+            {e.fertilized===true&&e.fertItems?.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:8}}>{e.fertItems.map(f=>(<span key={typeof f==="object"?f.name:f} style={{padding:"4px 12px",borderRadius:20,background:C.l,color:C.g,fontSize:13,fontWeight:700}}>{typeof f==="object"?`${f.name}${f.amount?" "+f.amount+"g":""}`:f}</span>))}</div>}
+          </div>
+          {(e.weather?.am||e.weather?.pm||e.location)&&<div style={s.card}><div style={s.ct}>🌤️ 環境・天候</div>{e.location&&<div style={{fontSize:14,marginBottom:6}}>📍 {e.location}</div>}{e.weather?.am&&<div>午前：{e.weather.am}</div>}{e.weather?.pm&&<div>午後：{e.weather.pm}</div>}</div>}
+          {(()=>{const sd=sharedEntries[e.date]||{};return(<div style={s.card}><div style={s.ct}>🌡️ 温度</div><TempDisp temp={sd.temp} roomTemp={sd.roomTemp}/>{!sd.temp?.max&&!sd.roomTemp?.morn&&<p style={{color:"#ccc",fontSize:13}}>記録なし</p>}</div>);})()}
+          {e.memo&&<div style={s.card}><div style={s.ct}>📝 メモ</div><p style={{fontSize:14,color:"#333",lineHeight:1.8,margin:0}}>{e.memo}</p></div>}
+          {e.photos?.length>0&&<div style={s.card}><div style={s.ct}>📷 写真 ({e.photos.length}枚)</div><div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:8}}>{e.photos.map((p,i)=><div key={i} onClick={()=>setImgViewer(p)} style={{cursor:"pointer"}}><img src={p.dataUrl} alt={p.caption} style={{width:"100%",aspectRatio:"4/3",objectFit:"cover",borderRadius:12,border:`2px solid ${C.l}`}}/>{p.caption&&<p style={{fontSize:12,color:"#666",marginTop:4,textAlign:"center"}}>{p.caption}</p>}</div>)}</div></div>}
+        </div>
+      </div>
+    </>
+  );
+
+  // ── ENTRY MODAL ───────────────────────────────────────────────────────────────
+  // IME-safe bindings — reset() called explicitly from openModal, NOT via useEffect
+  const imeWaterNote   = useIme("", setWaterNote);
+  const imeFertNote    = useIme("", setFertNote);
+  const imeMemo        = useIme("", setMemo);
+  // 共通情報用 IME bindings
+  // 数値入力は IME 不要のため、共通情報カード内で直接 defaultValue+onBlur を使用
+
+  const EntryModal = () => (
+    <>
+      <div style={s.overlay} onClick={()=>setModal(false)}/>
+      {/* Full-screen scroll container — キーボード表示時も画面全体はスクロールしない */}
+      <div style={s.sheet}>
+        {/* Sticky header inside modal */}
+        <div style={{position:"sticky",top:0,background:"#f8fdf9",zIndex:10,padding:"16px 16px 10px",borderBottom:`1px solid ${C.l}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <div style={{fontSize:16,fontWeight:900,color:"#0a1a0d"}}>{plant.emoji} ケア記録</div>
+            <div style={{fontSize:11,color:"#aaa"}}>🔐 AES-256暗号化して保存</div>
+          </div>
+          <button onClick={()=>setModal(false)} style={{background:"#eee",border:"none",borderRadius:"50%",width:34,height:34,fontSize:18,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+        </div>
+
+        <div style={{padding:"0 16px 40px"}}>
+          <label style={s.label}>📅 日付</label>
+          <input type="date" value={entryDate} onChange={e=>setEntryDate(e.target.value)} style={s.inp}/>
+
+          {/* 水やり — 3状態: null=未記録 / true=した / false=しなかった */}
+          <label style={s.label}>💧 水やり</label>
+          {[["🌅 朝",waterAm,setWaterAm],["🌇 夕",waterPm,setWaterPm]].map(([label,val,setVal])=>(
+            <div key={label} style={{marginBottom:8}}>
+              <div style={{fontSize:12,color:"#666",fontWeight:700,marginBottom:5}}>{label}</div>
+              <div style={{display:"flex",gap:6}}>
+                {[[true,"✅ した","#3b82f6"],[false,"🚫 しなかった","#ef4444"],[null,"— 未記録","#94a3b8"]].map(([v,lbl,col])=>(
+                  <button key={lbl} onClick={()=>setVal(v)}
+                    style={{flex:1,padding:"9px 4px",border:`2px solid ${val===v?col:C.l}`,borderRadius:10,background:val===v?"#f0f9ff":"#fafafa",color:val===v?col:"#ccc",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"inherit",transition:"all .15s"}}>
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+          {(waterAm===true||waterPm===true)&&(
+            <input placeholder="メモ（例：たっぷり、根元に）" style={{...s.inp,marginTop:4,fontSize:16}} {...imeWaterNote}/>
+          )}
+
+          {/* 肥料 — 3状態 + 品目ごと量入力 */}
+          <label style={s.label}>🌱 肥料</label>
+          <div style={{display:"flex",gap:6,marginBottom:8}}>
+            {[[true,"✅ 与えた",C.g],[false,"🚫 与えなかった","#ef4444"],[null,"— 未記録","#94a3b8"]].map(([v,lbl,col])=>(
+              <button key={String(v)} onClick={()=>setFertilized(v)}
+                style={{flex:1,padding:"9px 4px",border:`2px solid ${fertilized===v?col:C.l}`,borderRadius:10,background:fertilized===v?"#f0fdf4":"#fafafa",color:fertilized===v?col:"#ccc",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"inherit",transition:"all .15s"}}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+          {fertilized===true&&(
+            <div style={{background:C.l,borderRadius:14,padding:"12px 14px",marginBottom:4}}>
+              <div style={{fontSize:12,fontWeight:800,color:C.g,marginBottom:10}}>
+                何を与えましたか？（複数選択可）
+              </div>
+              {plant.fertilizers.map(name=>{
+                const item = fertItems.find(f=>(typeof f==="object"?f.name:f)===name);
+                const selected = !!item;
+                return (
+                  <div key={name} style={{marginBottom:8}}>
+                    <button
+                      onClick={()=>setFertItems(prev=>selected
+                        ?prev.filter(f=>(typeof f==="object"?f.name:f)!==name)
+                        :[...prev,{name,amount:""}]
+                      )}
+                      style={{width:"100%",padding:"10px 14px",border:`2px solid ${selected?C.g:C.l}`,borderRadius:10,background:selected?C.l:"#fff",color:selected?C.g:"#aaa",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"inherit",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <span>{selected?"✅":"○"} {name}</span>
+                      {selected&&<span style={{fontSize:11,color:C.g,opacity:0.7}}>量を入力 ↓</span>}
+                    </button>
+                    {selected&&(
+                      <div style={{display:"flex",alignItems:"center",gap:6,marginTop:5,paddingLeft:8}}>
+                        <input
+                          type="text" inputMode="decimal"
+                          placeholder="量（任意）"
+                          value={item.amount||""}
+                          onChange={e=>{
+                            const v=e.target.value;
+                            setFertItems(prev=>prev.map(f=>(typeof f==="object"?f.name:f)===name?{...f,amount:v}:{name:f,amount:""}));
+                          }}
+                          style={{flex:1,padding:"8px 10px",border:`2px solid ${C.l}`,borderRadius:8,fontSize:16,fontFamily:"inherit",outline:"none",background:"#fff"}}
+                        />
+                        <span style={{fontSize:13,color:"#888",whiteSpace:"nowrap"}}>g / ml</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              <input
+                placeholder="その他・自由入力（任意）"
+                style={{...s.inp,marginTop:4,fontSize:16,background:"#fff"}}
+                {...imeFertNote}
+              />
+            </div>
+          )}
+
+          {/* 管理場所：午前・午後 */}
+          <label style={s.label}>📍 管理場所</label>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            <div>
+              <div style={{fontSize:11,color:"#aaa",marginBottom:5,fontWeight:700}}>🌅 午前</div>
+              <div style={{display:"flex",gap:6}}>
+                {LOCATION_OPTIONS.map(l=>(
+                  <button key={l} style={{...s.chip(locAm===l),flex:1,padding:"8px 4px",fontSize:12}} onClick={()=>setLocAm(l===locAm?"":l)}>{l}</button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div style={{fontSize:11,color:"#aaa",marginBottom:5,fontWeight:700}}>🌇 午後</div>
+              <div style={{display:"flex",gap:6}}>
+                {LOCATION_OPTIONS.map(l=>(
+                  <button key={l} style={{...s.chip(locPm===l),flex:1,padding:"8px 4px",fontSize:12}} onClick={()=>setLocPm(l===locPm?"":l)}>{l}</button>
+                ))}
+              </div>
+            </div>
+          </div>
+          {locAm && locPm && locAm!==locPm && (
+            <div style={{fontSize:11,color:C.g,marginTop:5,padding:"5px 10px",background:C.l,borderRadius:8}}>
+              🔄 移動あり：{locAm} → {locPm}
+            </div>
+          )}
+
+          {/* 観察メモ */}
+          <label style={s.label}>📝 観察メモ</label>
+          <textarea placeholder="今日の様子、気づいたことなど…" rows={4}
+            style={{...s.inp,resize:"none",lineHeight:1.7,fontSize:16}}
+            {...imeMemo}/>
+
+          {/* 写真 */}
+          <label style={s.label}>📷 写真</label>
+          {photos.map((p,i)=>(
+            <div key={i} style={{position:"relative",marginBottom:8}}>
+              <img src={p.dataUrl} alt="" style={{width:"100%",borderRadius:12,objectFit:"cover",maxHeight:200}}/>
+              <input placeholder="説明（任意）"
+                style={{width:"100%",padding:"8px 10px",border:`2px solid ${C.l}`,borderRadius:8,fontSize:13,fontFamily:"inherit",boxSizing:"border-box",marginTop:4,outline:"none"}}
+                {...useIme(p.caption, v=>setPhotos(prev=>prev.map((x,j)=>j===i?{...x,caption:v}:x)))}
+              />
+              <button onClick={()=>setPhotos(prev=>prev.filter((_,j)=>j!==i))}
+                style={{position:"absolute",top:8,right:8,background:"rgba(0,0,0,0.6)",border:"none",color:"#fff",borderRadius:"50%",width:28,height:28,fontSize:15,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+            </div>
+          ))}
+          <input ref={fileRef} type="file" accept="image/*" multiple style={{display:"none"}} onChange={handleFiles}/>
+          <button onClick={()=>fileRef.current.click()}
+            style={{width:"100%",padding:12,border:`2px dashed ${C.m}`,borderRadius:12,background:C.l,color:C.g,fontWeight:700,fontSize:14,cursor:"pointer",marginBottom:8,fontFamily:"inherit"}}>
+            📷 写真を追加
+          </button>
+
+          {/* AI Photo Diff */}
+          {photos.length>0&&(
+            <div style={{background:"linear-gradient(135deg,#f0fdf4,#e8f5e9)",border:`1.5px solid ${C.m}`,borderRadius:14,padding:"12px 14px",marginBottom:8}}>
+              <div style={{fontSize:13,fontWeight:800,color:C.g,marginBottom:6}}>🤖 AI写真差分ナビゲート</div>
+              {prevPhotoEntry?(
+                <>
+                  <div style={{fontSize:12,color:"#888",marginBottom:8}}>前回（{fmtDate(prevPhotoEntry.date)}）と比較</div>
+                  <div style={{display:"flex",gap:8,marginBottom:6}}>
+                    <img src={prevPhotoEntry.photos[0].dataUrl} alt="前回" style={{width:"48%",borderRadius:8,objectFit:"cover",aspectRatio:"4/3",opacity:0.75}}/>
+                    <img src={photos[0].dataUrl} alt="今回" style={{width:"48%",borderRadius:8,objectFit:"cover",aspectRatio:"4/3"}}/>
+                  </div>
+                  <button onClick={runAiDiff} disabled={aiDiffLoading}
+                    style={{width:"100%",padding:"10px",background:`linear-gradient(90deg,${C.g},${C.m})`,color:"#fff",border:"none",borderRadius:10,fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"inherit"}}>
+                    {aiDiffLoading?"🔍 AI分析中…":"🔍 AIに差分を分析させる"}
+                  </button>
+                  {aiDiffResult&&<div style={s.aiBubble}>{aiDiffResult}</div>}
+                </>
+              ):(
+                <p style={{fontSize:12,color:"#aaa",margin:0}}>前回の写真記録がまだありません。次回から使えます。</p>
+              )}
+            </div>
+          )}
+
+          <button style={{...s.saveBtn,marginBottom:20}} onClick={saveEntry} disabled={syncing}>
+            {syncing?"🔐 暗号化・同期中…":"🔐 暗号化して保存・同期"}
+          </button>
+        </div>
+      </div>
+    </>
+  );
+
+  // ── Loading / decrypt error ────────────────────────────────────────────────────
+  if (loading) return (
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#f0faf2",fontFamily:"'Hiragino Sans',sans-serif"}}>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:42,marginBottom:10}}>🔐</div>
+        <div style={{fontSize:15,color:C.g,fontWeight:700}}>暗号化データを復号中…</div>
+      </div>
+    </div>
+  );
+
+  if (decryptError) return (
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#fff5f5",fontFamily:"'Hiragino Sans',sans-serif",padding:20}}>
+      <div style={{textAlign:"center",maxWidth:320}}>
+        <div style={{fontSize:42,marginBottom:10}}>⚠️</div>
+        <div style={{fontSize:16,color:"#b91c1c",fontWeight:800,marginBottom:8}}>データの復号に失敗しました</div>
+        <button onClick={doLogout} style={{marginTop:16,padding:"12px 24px",background:"#dc2626",color:"#fff",border:"none",borderRadius:12,fontWeight:700,cursor:"pointer",fontFamily:"inherit",fontSize:14}}>
+          🚪 ログアウトして再試行
+        </button>
+      </div>
+    </div>
+  );
+
+  // ── Main render ───────────────────────────────────────────────────────────────
+  const tabs = [["diary","📓 日記"],["graph","📊 グラフ"],["schedule","📆 予定"],["info","ℹ️ 情報"]];
+  if (auth.isAdmin) tabs.push(["security","🔒 セキュリティ"]);
+
+  return (
+    <div style={s.app}>
+      <div style={s.hdr}>
+        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between"}}>
+          <div>
+            <p style={s.htitle}>🌱 植物ケアマネージャー</p>
+            <p style={s.hsub}>{today.getFullYear()}年{today.getMonth()+1}月{today.getDate()}日</p>
+          </div>
+          <button onClick={doLogout} style={{background:"rgba(255,255,255,0.18)",border:"none",color:"#fff",borderRadius:10,padding:"7px 12px",fontSize:12,cursor:"pointer",fontWeight:700,fontFamily:"inherit",marginTop:2,whiteSpace:"nowrap"}}>
+            🚪 ログアウト
+          </button>
+        </div>
+        <div style={s.sbadge}>
+          <span>🔐 AES-256</span>
+          <span style={{opacity:0.4}}>｜</span>
+          <span>🔗 共有</span>
+          <span style={{opacity:0.4}}>｜</span>
+          <span>{auth.id}{auth.isAdmin?" 👑":""}</span>
+        </div>
+        <div style={s.ptabs}>
+          {PLANTS.map(p=>(
+            <button key={p.id} style={s.ptab(plant.id===p.id)} onClick={()=>setPlant(p)}>{p.emoji} {p.name}</button>
+          ))}
+        </div>
+      </div>
+
+      <div style={s.nav}>
+        {tabs.map(([k,l])=>(
+          <button key={k} style={s.navBtn(tab===k)} onClick={()=>setTab(k)}>{l}</button>
+        ))}
+      </div>
+
+      {tab==="diary"    && <DiaryTab/>}
+      {tab==="graph"    && <GraphTab/>}
+      {tab==="schedule" && <ScheduleTab/>}
+      {tab==="info"     && (
+        <div style={s.wrap}>
+          <div style={s.card}>
+            <div style={s.ct}>ℹ️ 基本情報 — {plant.emoji} {plant.name}</div>
+            {[["種別",plant.type],["使用土",plant.soil],["登録肥料",plant.fertilizers.join("、")]].map(([k,v])=>(
+              <div key={k} style={{display:"flex",padding:"10px 0",borderBottom:`1px solid ${C.l}`}}>
+                <span style={{fontSize:13,color:"#aaa",fontWeight:700,width:"36%"}}>{k}</span>
+                <span style={{fontSize:13,color:"#333"}}>{v}</span>
+              </div>
+            ))}
+            <div style={{marginTop:14,padding:12,background:C.l,borderRadius:12}}>
+              <div style={{fontSize:12,fontWeight:800,color:C.g,marginBottom:4}}>🔐 データ保護</div>
+              <p style={{fontSize:12,color:"#555",margin:0,lineHeight:1.7}}>全記録をAES-256-GCMで暗号化して保存。同じClaudeアカウントでPC・スマホ共有。タブを閉じると自動ログアウト。</p>
+            </div>
+          </div>
+        </div>
+      )}
+      {tab==="security" && auth.isAdmin && <SecurityTab/>}
+
+      {tab==="diary"&&<button style={s.fab} onClick={()=>openModal(todayStr())}>+</button>}
+
+      {modal&&<EntryModal/>}
+      {viewing&&<DetailView e={viewing}/>}
+
+      {imgViewer&&(
+        <div onClick={()=>setImgViewer(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.96)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",cursor:"pointer"}}>
+          <img src={imgViewer.dataUrl} alt={imgViewer.caption} style={{maxWidth:"100%",maxHeight:"80vh",objectFit:"contain"}}/>
+          {imgViewer.caption&&<p style={{color:"#fff",marginTop:14,fontSize:14,textAlign:"center",padding:"0 20px"}}>{imgViewer.caption}</p>}
+          <p style={{color:"#555",fontSize:12,marginTop:12}}>タップして閉じる</p>
+        </div>
+      )}
+
+      {toast&&<div style={s.toast(toast.type)}>{toast.msg}</div>}
+    </div>
+  );
+}
+
+
+// GitHub Pages (Babel standalone) 向けマウント
+if (typeof window !== "undefined") {
+  window.__PCM_APP__ = App;
+  // ReactDOM が利用可能なら即マウント
+  const tryMount = () => {
+    if (typeof ReactDOM !== "undefined" && document.getElementById("root")) {
+      ReactDOM.createRoot(document.getElementById("root")).render(
+        React.createElement(App)
+      );
+      const el = document.getElementById("loading");
+      if (el) { el.style.opacity = "0"; setTimeout(() => el.remove(), 500); }
+    } else {
+      setTimeout(tryMount, 50);
+    }
+  };
+  tryMount();
+}
+
+  </script>
 </body>
 </html>
